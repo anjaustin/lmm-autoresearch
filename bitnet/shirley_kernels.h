@@ -526,6 +526,98 @@ static float shirley_mul_i16_i8_to_i8(
 }
 
 /* ================================================================
+ *  Post-matmul rescale: int32 → int8 (THE BRIDGE)
+ *
+ *  The ternary matmul (sign_epi8) produces int32 dot products.
+ *  This operation quantizes them to int8 for the next pipeline stage.
+ *
+ *  In the full pipeline, a combined_scale factor (weight_scale / act_scale)
+ *  is applied before quantization. This is a per-layer constant,
+ *  precomputed at model load time.
+ *
+ *  Returns the dequantization scale: real_value = int8_value * returned_scale
+ * ================================================================ */
+
+/* Variant A: Raw int32 → int8 (no multiplier, just quantize) */
+static float shirley_rescale_i32_to_i8(
+    int8_t        * restrict dst,
+    const int32_t * restrict src,
+    int           n,
+    int           out_range
+) {
+    /* Find max abs */
+    int32_t max_abs = 0;
+    int i;
+
+    for (i = 0; i < n; i++) {
+        int32_t a = src[i] > 0 ? src[i] : -src[i];
+        if (a > max_abs) max_abs = a;
+    }
+
+    if (max_abs == 0) {
+        for (i = 0; i < n; i++) dst[i] = 0;
+        return 0.0f;
+    }
+
+    /* Quantize: dst = round(src * out_range / max_abs) clamped to ±out_range
+     * Integer: dst = (src * out_range + max_abs/2) / max_abs */
+    int64_t half = (int64_t)max_abs / 2;
+    for (i = 0; i < n; i++) {
+        int64_t v = (int64_t)src[i] * out_range;
+        int32_t r;
+        if (v >= 0) r = (int32_t)((v + half) / max_abs);
+        else        r = (int32_t)(-((-v + half) / max_abs));
+        if (r > out_range) r = out_range;
+        if (r < -out_range) r = -out_range;
+        dst[i] = (int8_t)r;
+    }
+
+    return (float)max_abs / (float)out_range;
+}
+
+/* Variant B: int32 → int8 with a pre-applied scalar multiplier.
+ * effective_value = src[i] * combined_scale (where combined_scale = wt_scale / act_scale)
+ * Then quantize effective_value to int8 at ±out_range.
+ *
+ * combined_scale is a float for now — in the full ternary pipeline,
+ * this would be an MTFP21 value converted to fixed-point.
+ * Returns the full dequantization scale: real_value = int8 * returned_scale */
+static float shirley_rescale_i32_scaled_to_i8(
+    int8_t        * restrict dst,
+    const int32_t * restrict src,
+    int           n,
+    int           out_range,
+    float         combined_scale  /* weight_scale / act_scale, per-layer constant */
+) {
+    /* Find max abs of scaled values */
+    float max_abs = 0.0f;
+    int i;
+
+    for (i = 0; i < n; i++) {
+        float v = (float)src[i] * combined_scale;
+        float a = v > 0 ? v : -v;
+        if (a > max_abs) max_abs = a;
+    }
+
+    if (max_abs < 1e-10f) {
+        for (i = 0; i < n; i++) dst[i] = 0;
+        return 0.0f;
+    }
+
+    /* Quantize to int8 */
+    float quant_scale = (float)out_range / max_abs;
+    for (i = 0; i < n; i++) {
+        float v = (float)src[i] * combined_scale * quant_scale;
+        int32_t r = (int32_t)roundf(v);
+        if (r > out_range) r = out_range;
+        if (r < -out_range) r = -out_range;
+        dst[i] = (int8_t)r;
+    }
+
+    return max_abs / (float)out_range;
+}
+
+/* ================================================================
  *  Legacy: int8→int8 RMSNorm (float rsqrt, for backward compat)
  * ================================================================ */
 

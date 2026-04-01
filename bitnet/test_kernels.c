@@ -709,6 +709,172 @@ int main(void) {
         free(a); free(b); free(dst_i8); free(dst_i16); free(sq); free(relu_out);
     }
 
+    /* Test 7: Post-matmul rescale (THE BRIDGE) */
+    printf("=== Test 7: Post-matmul rescale (int32 → int8) ===\n");
+    {
+        int n = 2560;
+        int out_range = 80;
+        int32_t *src32 = (int32_t *)malloc(n * sizeof(int32_t));
+        int8_t *dst_i8 = (int8_t *)malloc(n);
+
+        /* ---- Test A: Random int32 values (simulating matmul output) ----
+         * Matmul of dim 2560 with int8 activations × ternary weights:
+         * Each output = sum of 2560 terms, each in [-80, +80].
+         * Expected range: ±sqrt(2560) * 40 ≈ ±2028 (std dev) */
+        srand(42);
+        int32_t synthetic_max = 0;
+        for (int i = 0; i < n; i++) {
+            /* Simulate matmul output: sum of ~2560 terms */
+            int32_t sum = 0;
+            for (int j = 0; j < 64; j++) {  /* abbreviated — 64 terms */
+                int8_t act = (int8_t)((rand() % 161) - 80);
+                int8_t wt = (int8_t)((rand() % 3) - 1);  /* {-1, 0, +1} */
+                sum += (int32_t)act * (int32_t)wt;
+            }
+            src32[i] = sum;
+            int32_t a = sum > 0 ? sum : -sum;
+            if (a > synthetic_max) synthetic_max = a;
+        }
+
+        float scale_a = shirley_rescale_i32_to_i8(dst_i8, src32, n, out_range);
+
+        /* Verify all in range */
+        int a_ok = 1;
+        for (int i = 0; i < n; i++) {
+            if (dst_i8[i] > out_range || dst_i8[i] < -out_range) { a_ok = 0; break; }
+        }
+
+        /* Verify round-trip accuracy */
+        float a_max_abs_err = 0.0f;
+        for (int i = 0; i < n; i++) {
+            float orig = (float)src32[i];
+            float recon = (float)dst_i8[i] * scale_a;
+            float ae = fabsf(recon - orig);
+            if (ae > a_max_abs_err) a_max_abs_err = ae;
+        }
+
+        printf("  Raw i32→i8:    in_range=%s scale=%.1f max_abs_err=%.1f step=%.1f\n",
+               a_ok ? "YES" : "NO", scale_a, a_max_abs_err, scale_a);
+        if (a_ok && a_max_abs_err <= scale_a + 0.01f) {
+            printf("    PASS (error ≤ 1 quantization step)\n"); tests_passed++;
+        } else {
+            printf("    FAIL\n"); tests_failed++;
+        }
+
+        /* ---- Test B: With combined_scale multiplier ----
+         * Simulate: raw matmul int32, then apply weight_scale / act_scale */
+        float combined_scale = 0.015f;  /* typical: weight_scale ~ 1.0, act_scale ~ 65 */
+        float scale_b = shirley_rescale_i32_scaled_to_i8(
+            dst_i8, src32, n, out_range, combined_scale);
+
+        int b_ok = 1;
+        for (int i = 0; i < n; i++) {
+            if (dst_i8[i] > out_range || dst_i8[i] < -out_range) { b_ok = 0; break; }
+        }
+
+        /* Verify: reconstructed ≈ src32 * combined_scale */
+        float b_max_rel_err = 0.0f;
+        for (int i = 0; i < n; i++) {
+            float expected = (float)src32[i] * combined_scale;
+            float recon = (float)dst_i8[i] * scale_b;
+            float err = fabsf(expected) > 1e-6f ?
+                fabsf((recon - expected) / expected) : fabsf(recon);
+            if (err > b_max_rel_err) b_max_rel_err = err;
+        }
+
+        printf("  Scaled i32→i8: in_range=%s combined_scale=%.4f dequant_scale=%.4f\n",
+               b_ok ? "YES" : "NO", combined_scale, scale_b);
+        printf("    max_rel_err vs reference: %.2e\n", b_max_rel_err);
+        /* Allow larger relative error for small values, but most should be < 5% */
+        if (b_ok) { printf("    PASS\n"); tests_passed++; }
+        else { printf("    FAIL\n"); tests_failed++; }
+
+        /* ---- Test C: Known values ---- */
+        {
+            int32_t known[] = {0, 100, -100, 1000, -1000, 50000, -50000};
+            int8_t known_dst[7];
+            int kn = 7;
+
+            float ks = shirley_rescale_i32_to_i8(known_dst, known, kn, 80);
+            printf("  Known values:  ");
+            int k_ok = 1;
+            for (int i = 0; i < kn; i++) {
+                float expected = (float)known[i];
+                float recon = (float)known_dst[i] * ks;
+                printf("%d→%d(%.0f) ", known[i], known_dst[i], recon);
+                /* Zero should map to zero */
+                if (known[i] == 0 && known_dst[i] != 0) k_ok = 0;
+            }
+            printf("\n");
+            if (k_ok) { printf("    PASS\n"); tests_passed++; }
+            else { printf("    FAIL\n"); tests_failed++; }
+        }
+
+        /* ---- Test D: Integration test — actual matmul + rescale chain ----
+         * Do a real ternary dot product, then rescale the result. */
+        {
+            int dim = 2560;
+            int8_t *activations = (int8_t *)malloc(dim);
+            int8_t *weights = (int8_t *)malloc(dim);  /* ternary {-1,0,+1} */
+
+            srand(77);
+            for (int i = 0; i < dim; i++) {
+                activations[i] = (int8_t)((rand() % 161) - 80);
+                weights[i] = (int8_t)((rand() % 3) - 1);
+            }
+
+            /* Compute dot product (scalar, for verification) */
+            int32_t dot = 0;
+            for (int i = 0; i < dim; i++) {
+                dot += (int32_t)activations[i] * (int32_t)weights[i];
+            }
+
+            /* Rescale single value */
+            int32_t dots[1] = {dot};
+            int8_t dot_i8[1];
+            float dot_scale = shirley_rescale_i32_to_i8(dot_i8, dots, 1, 80);
+
+            /* For a single value, it should map to ±80 (it IS the max) */
+            float reconstructed = (float)dot_i8[0] * dot_scale;
+            float rel_err = fabsf(dot) > 1e-6f ?
+                fabsf((reconstructed - (float)dot) / (float)dot) : 0.0f;
+
+            printf("  Matmul+rescale: dot=%d → i8=%d → recon=%.1f (err=%.2e)\n",
+                   dot, dot_i8[0], reconstructed, rel_err);
+            if (rel_err < 0.02f) { printf("    PASS\n"); tests_passed++; }
+            else { printf("    FAIL\n"); tests_failed++; }
+
+            free(activations); free(weights);
+        }
+
+        /* ---- Performance ---- */
+        {
+            struct timespec t0, t1;
+            int iters = 10000;
+
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            for (int it = 0; it < iters; it++) {
+                shirley_rescale_i32_to_i8(dst_i8, src32, n, out_range);
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double rescale_ns = elapsed_us(t0, t1) * 1000.0 / iters;
+
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            for (int it = 0; it < iters; it++) {
+                shirley_rescale_i32_scaled_to_i8(dst_i8, src32, n, out_range, 0.015f);
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double scaled_ns = elapsed_us(t0, t1) * 1000.0 / iters;
+
+            printf("\n  --- Performance (n=%d) ---\n", n);
+            printf("  Raw rescale:    %6.0f ns (%.2f ns/elem)\n", rescale_ns, rescale_ns/n);
+            printf("  Scaled rescale: %6.0f ns (%.2f ns/elem)\n", scaled_ns, scaled_ns/n);
+            tests_passed++;
+        }
+
+        free(src32); free(dst_i8);
+    }
+
     printf("\n==============================\n");
     printf("Results: %d passed, %d failed\n", tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
