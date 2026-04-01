@@ -12523,11 +12523,16 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                             if (a > max_abs) max_abs = a;
                         }
                         if (max_abs > 1e-10f) {
-                            float s5t = 121.0f / max_abs;
+                            // SHIRLEY_TRIT_LEVELS: (3^N - 1) / 2
+// 5 trits: 121, 4 trits: 40, 3 trits: 13, 6 trits: 364
+#ifndef SHIRLEY_TRIT_MAX
+#define SHIRLEY_TRIT_MAX 121.0f
+#endif
+                            float s5t = SHIRLEY_TRIT_MAX / max_abs;
                             for (int row = 0; row < 16; row++) {
                                 float v = tmp[row] * s5t;
-                                if (v > 121.0f) v = 121.0f;
-                                if (v < -121.0f) v = -121.0f;
+                                if (v > SHIRLEY_TRIT_MAX) v = SHIRLEY_TRIT_MAX;
+                                if (v < -SHIRLEY_TRIT_MAX) v = -SHIRLEY_TRIT_MAX;
                                 tmp[row] = roundf(v) / s5t;
                             }
                         }
@@ -13298,11 +13303,16 @@ UseGgmlGemm2:;
                             if (a > max_abs) max_abs = a;
                         }
                         if (max_abs > 1e-10f) {
-                            float s5t = 121.0f / max_abs;
+                            // SHIRLEY_TRIT_LEVELS: (3^N - 1) / 2
+// 5 trits: 121, 4 trits: 40, 3 trits: 13, 6 trits: 364
+#ifndef SHIRLEY_TRIT_MAX
+#define SHIRLEY_TRIT_MAX 121.0f
+#endif
+                            float s5t = SHIRLEY_TRIT_MAX / max_abs;
                             for (int row = 0; row < n_rows; row++) {
                                 float v = tmp[col * n_rows + row] * s5t;
-                                if (v > 121.0f) v = 121.0f;
-                                if (v < -121.0f) v = -121.0f;
+                                if (v > SHIRLEY_TRIT_MAX) v = SHIRLEY_TRIT_MAX;
+                                if (v < -SHIRLEY_TRIT_MAX) v = -SHIRLEY_TRIT_MAX;
                                 tmp[col * n_rows + row] = roundf(v) / s5t;
                             }
                         }
@@ -13339,11 +13349,16 @@ UseGgmlGemm2:;
                             if (a > max_abs) max_abs = a;
                         }
                         if (max_abs > 1e-10f) {
-                            float s5t = 121.0f / max_abs;
+                            // SHIRLEY_TRIT_LEVELS: (3^N - 1) / 2
+// 5 trits: 121, 4 trits: 40, 3 trits: 13, 6 trits: 364
+#ifndef SHIRLEY_TRIT_MAX
+#define SHIRLEY_TRIT_MAX 121.0f
+#endif
+                            float s5t = SHIRLEY_TRIT_MAX / max_abs;
                             for (int row = 0; row < n_rows; row++) {
                                 float v = tmp[row] * s5t;
-                                if (v > 121.0f) v = 121.0f;
-                                if (v < -121.0f) v = -121.0f;
+                                if (v > SHIRLEY_TRIT_MAX) v = SHIRLEY_TRIT_MAX;
+                                if (v < -SHIRLEY_TRIT_MAX) v = -SHIRLEY_TRIT_MAX;
                                 tmp[row] = roundf(v) / s5t;
                             }
                         }
