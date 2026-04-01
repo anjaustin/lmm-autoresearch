@@ -12645,6 +12645,47 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
                     memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
                 }
+
+                /* Shirley bridge: write int8 alongside float32 */
+                if (dst->shirley_bridge && src0->type == GGML_TYPE_I2_S) {
+                    /* Lazy-allocate the int8 side-buffer on first use */
+                    if (!dst->shirley_i8) {
+                        dst->shirley_i8 = calloc(ne0 * ne1, sizeof(int8_t));
+                    }
+                    if (dst->shirley_i8) {
+                        int n_rows_written = MIN(iir0 + blck_0, ir0_end) - iir0;
+                        int8_t * i8_dst = (int8_t *)dst->shirley_i8 + (i1 * ne0 + iir0);
+
+                        /* Quantize the float tmp values to int8 at ±80 */
+                        float max_abs = 0.0f;
+                        for (int r = 0; r < n_rows_written; r++) {
+                            float a = fabsf(tmp[r]);
+                            if (a > max_abs) max_abs = a;
+                        }
+                        if (max_abs > 1e-10f) {
+                            float qscale = 80.0f / max_abs;
+                            for (int r = 0; r < n_rows_written; r++) {
+                                int v = (int)roundf(tmp[r] * qscale);
+                                if (v > 80) v = 80;
+                                if (v < -80) v = -80;
+                                i8_dst[r] = (int8_t)v;
+                            }
+                            dst->shirley_scale = max_abs / 80.0f;
+                        } else {
+                            for (int r = 0; r < n_rows_written; r++) i8_dst[r] = 0;
+                            dst->shirley_scale = 0.0f;
+                        }
+
+                        /* Log once */
+                        {
+                            static int bridge_logged = 0;
+                            if (!bridge_logged) {
+                                fprintf(stderr, "shirley: bridge active (int8 side-buffer, range ±80)\n");
+                                bridge_logged = 1;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -13410,6 +13451,34 @@ UseGgmlGemm2:;
                     }
 #endif
                     memcpy((float *)((char *) dst->data + (col * nb1)) + src0_start, tmp + col * n_rows, n_rows * sizeof(float));
+
+                    /* Shirley bridge: write int8 for gemm path */
+                    if (dst->shirley_bridge) {
+                        { static int bl=0; if(!bl){fprintf(stderr,"shirley: bridge active (gemm path)\n");bl=1;} }
+                        if (!dst->shirley_i8) {
+                            dst->shirley_i8 = calloc(ne0 * ne1, sizeof(int8_t));
+                        }
+                        if (dst->shirley_i8) {
+                            int8_t * i8_dst = (int8_t *)dst->shirley_i8 + (col * ne0 + src0_start);
+                            float max_abs = 0.0f;
+                            for (int row = 0; row < n_rows; row++) {
+                                float a = fabsf(tmp[col * n_rows + row]);
+                                if (a > max_abs) max_abs = a;
+                            }
+                            if (max_abs > 1e-10f) {
+                                float qscale = 80.0f / max_abs;
+                                for (int row = 0; row < n_rows; row++) {
+                                    int v = (int)roundf(tmp[col * n_rows + row] * qscale);
+                                    if (v > 80) v = 80;
+                                    if (v < -80) v = -80;
+                                    i8_dst[row] = (int8_t)v;
+                                }
+                                dst->shirley_scale = max_abs / 80.0f;
+                            } else {
+                                for (int row = 0; row < n_rows; row++) i8_dst[row] = 0;
+                            }
+                        }
+                    }
                 }
             }
             else {
@@ -13456,6 +13525,34 @@ UseGgmlGemm2:;
                     }
 #endif
                     memcpy((float *)((char *) dst->data + (iter * nb1)) + src0_start, tmp, n_rows * sizeof(float));
+
+                    /* Shirley bridge: write int8 for gemv path */
+                    if (dst->shirley_bridge) {
+                        { static int bl2=0; if(!bl2){fprintf(stderr,"shirley: bridge active (gemv path)\n");bl2=1;} }
+                        if (!dst->shirley_i8) {
+                            dst->shirley_i8 = calloc(ne0 * ne1, sizeof(int8_t));
+                        }
+                        if (dst->shirley_i8) {
+                            int8_t * i8_dst = (int8_t *)dst->shirley_i8 + (iter * ne0 + src0_start);
+                            float max_abs = 0.0f;
+                            for (int row = 0; row < n_rows; row++) {
+                                float a = fabsf(tmp[row]);
+                                if (a > max_abs) max_abs = a;
+                            }
+                            if (max_abs > 1e-10f) {
+                                float qscale = 80.0f / max_abs;
+                                for (int row = 0; row < n_rows; row++) {
+                                    int v = (int)roundf(tmp[row] * qscale);
+                                    if (v > 80) v = 80;
+                                    if (v < -80) v = -80;
+                                    i8_dst[row] = (int8_t)v;
+                                }
+                                dst->shirley_scale = max_abs / 80.0f;
+                            } else {
+                                for (int row = 0; row < n_rows; row++) i8_dst[row] = 0;
+                            }
+                        }
+                    }
                 }
             }
             else {
