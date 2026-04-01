@@ -12113,6 +12113,30 @@ static void ggml_compute_forward_rms_norm_f32(
                 const float scale = 1.0f/sqrtf(mean + eps);
 
                 ggml_vec_scale_f32(ne00, y, scale);
+
+#ifdef SHIRLEY_5TRIT_QUANT
+                // Quantize RMSNorm output to ternary precision
+                {
+                    float max_abs = 0.0f;
+                    for (int64_t i00 = 0; i00 < ne00; i00++) {
+                        float a = fabsf(y[i00]);
+                        if (a > max_abs) max_abs = a;
+                    }
+                    if (max_abs > 1e-10f) {
+                        // RMSNorm output needs more precision than matmul output
+#ifndef SHIRLEY_NORM_TRIT_MAX
+#define SHIRLEY_NORM_TRIT_MAX 121.0f
+#endif
+                        float s5t = SHIRLEY_NORM_TRIT_MAX / max_abs;
+                        for (int64_t i00 = 0; i00 < ne00; i00++) {
+                            float v = y[i00] * s5t;
+                            if (v > SHIRLEY_NORM_TRIT_MAX) v = SHIRLEY_NORM_TRIT_MAX;
+                            if (v < -SHIRLEY_NORM_TRIT_MAX) v = -SHIRLEY_NORM_TRIT_MAX;
+                            y[i00] = roundf(v) / s5t;
+                        }
+                    }
+                }
+#endif
             }
         }
     }
