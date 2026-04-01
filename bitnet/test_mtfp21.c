@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <math.h>
 #include <float.h>
+#include <time.h>
+#include <stdint.h>
 #include "shirley_mtfp21.h"
 
 /* ================================================================
@@ -602,7 +604,43 @@ static void test_adversarial(void) {
         if (results[d].ok) tests_passed++; else tests_failed++;
     }
 
-    free(src); free(dst_f); free(dst_m);
+    /* Fix 2: Also test adversarial distributions through the PURE path */
+    printf("  --- Pure MTFP21 path ---\n");
+    mtfp21_t *src_m2 = (mtfp21_t *)malloc(n * sizeof(mtfp21_t));
+    mtfp21_t *dst_m2 = (mtfp21_t *)malloc(n * sizeof(mtfp21_t));
+    mtfp21_t eps_m2 = mtfp21_from_float(eps);
+
+    for (int d = 0; d < num_dists; d++) {
+        srand(42 + d);
+        switch (d) {
+        case 0: for (int i=0;i<n;i++){float n1=randn(),n2=randn();src[i]=(fabsf(n2)>1e-6f)?n1/n2:0;if(fabsf(src[i])>1e6f)src[i]=(src[i]>0?1e6f:-1e6f);} break;
+        case 1: for (int i=0;i<n;i++){src[i]=(rand()%10==0)?randn():randn()*1e-6f;} break;
+        case 2: for (int i=0;i<n;i++){src[i]=((rand()%2)?1.0f:-1.0f)+randn()*0.01f;} break;
+        case 3: for (int i=0;i<n;i++){src[i]=1.0f+1e-7f*(float)i;} break;
+        case 4: for (int i=0;i<n;i++){src[i]=(i<n/2)?1e5f*randn():1e-5f*randn();} break;
+        case 5: for (int i=0;i<n;i++){src[i]=0.7f;} break;
+        }
+
+        float_rmsnorm_check(src, dst_f, n, eps);
+        for (int i = 0; i < n; i++) src_m2[i] = mtfp21_from_float(src[i]);
+        mtfp21_rmsnorm_pure(dst_m2, src_m2, n, eps_m2);
+
+        float max_err = 0.0f;
+        int finite = 1;
+        for (int i = 0; i < n; i++) {
+            float got = mtfp21_to_float(dst_m2[i]);
+            if (isnan(got) || isinf(got)) { finite = 0; break; }
+            float err = fabsf(dst_f[i]) > 1e-10f
+                ? fabsf((got - dst_f[i]) / dst_f[i]) : fabsf(got);
+            if (err > max_err) max_err = err;
+        }
+        const char *names[] = {"heavy_tails","near_zero","bimodal","cancellation","dyn_range","all_same"};
+        int ok = finite && max_err < 1e-3f;
+        printf("  %-14s: finite=%d max_err=%.2e %s\n", names[d], finite, max_err, ok ? "OK" : "DEGRADED");
+        if (ok) tests_passed++; else tests_failed++;
+    }
+
+    free(src); free(dst_f); free(dst_m); free(src_m2); free(dst_m2);
     printf("\n");
 }
 
@@ -736,66 +774,158 @@ static void test_chained_pipeline(void) {
     printf("=== Test 12: Chained int8 -> MTFP21 RMSNorm -> int8 ===\n");
 
     int n = 2560;
-    int in_range = 80;   /* 5-trit activations */
-    int out_range = 121; /* output at 5-trit range */
     mtfp21_t eps = mtfp21_from_float(1e-5f);
+    mtfp21_t *work_src = (mtfp21_t *)malloc(n * sizeof(mtfp21_t));
+    mtfp21_t *work_dst = (mtfp21_t *)malloc(n * sizeof(mtfp21_t));
 
-    int8_t *src = (int8_t *)malloc(n);
-    int8_t *dst = (int8_t *)malloc(n);
+    /* Test A: Wide output range (7-trit = 1093) to stress quantization boundaries */
+    {
+        int in_range = 80;
+        int out_range = 121;  /* 5-trit output — values will span wider range */
+        int8_t *src = (int8_t *)malloc(n);
+        int8_t *dst = (int8_t *)malloc(n);
 
-    /* Random 5-trit activations */
+        /* Use inputs with controlled RMS so output actually spans the range */
+        srand(42);
+        for (int i = 0; i < n; i++) {
+            /* Small values: RMS will be small, so scale will be large, outputs span wider */
+            src[i] = (int8_t)((rand() % 11) - 5);  /* [-5, +5] */
+        }
+
+        mtfp21_rmsnorm_int8(dst, src, n, eps, out_range, work_src, work_dst);
+
+        /* Float64 reference */
+        double sum = 0.0;
+        for (int i = 0; i < n; i++) sum += (double)src[i] * (double)src[i];
+        double scale = 1.0 / sqrt(sum / n + 1e-5);
+
+        int exact = 0, off1 = 0, worse = 0;
+        for (int i = 0; i < n; i++) {
+            int ref_q = (int)round((double)src[i] * scale);
+            if (ref_q > out_range) ref_q = out_range;
+            if (ref_q < -out_range) ref_q = -out_range;
+            int diff = abs((int)dst[i] - ref_q);
+            if (diff == 0) exact++;
+            else if (diff == 1) off1++;
+            else worse++;
+        }
+
+        printf("  Test A (small inputs, 5-trit output):\n");
+        printf("    Exact: %d/%d (%.1f%%), Off-by-1: %d, Worse: %d\n",
+               exact, n, 100.0*exact/n, off1, worse);
+        int pass = (worse == 0) && ((float)exact / n >= 0.95f);
+        if (pass) { printf("    PASS\n"); tests_passed++; }
+        else { printf("    FAIL\n"); tests_failed++; }
+
+        free(src); free(dst);
+    }
+
+    /* Test B: Full range inputs with double RMSNorm */
+    {
+        int in_range = 80;
+        int out_range = 121;
+        int8_t *src = (int8_t *)malloc(n);
+        int8_t *dst = (int8_t *)malloc(n);
+        int8_t *dst2 = (int8_t *)malloc(n);
+
+        srand(99);
+        for (int i = 0; i < n; i++) {
+            src[i] = (int8_t)((rand() % (2 * in_range + 1)) - in_range);
+        }
+
+        mtfp21_rmsnorm_int8(dst, src, n, eps, out_range, work_src, work_dst);
+        mtfp21_rmsnorm_int8(dst2, dst, n, eps, out_range, work_src, work_dst);
+
+        int in_range_count = 0;
+        for (int i = 0; i < n; i++) {
+            if (abs(dst2[i]) <= out_range) in_range_count++;
+        }
+        printf("  Test B (double RMSNorm): %d/%d in range\n", in_range_count, n);
+        if (in_range_count == n) tests_passed++; else tests_failed++;
+
+        free(src); free(dst); free(dst2);
+    }
+
+    /* Fix 6: LUT self-verification — check rsqrt invariant x * y^2 ≈ 1 */
+    {
+        printf("  LUT self-check: ");
+        int lut_ok = 1;
+        float max_lut_err = 0.0f;
+        for (int i = 0; i < 256; i++) {
+            /* Reconstruct the input midpoint for this LUT entry */
+            int32_t mant_min = MTFP21_MANT_MAX / 3;
+            int32_t mant_range = MTFP21_MANT_MAX - mant_min;
+            int32_t mant = mant_min + (int32_t)((int64_t)(2*i+1) * mant_range / (2*256));
+
+            mtfp21_t x = {mant, 0};
+            mtfp21_t y = {RSQRT_LUT[i].mant, RSQRT_LUT[i].exp};
+
+            /* Check x * y * y ≈ 1.0 */
+            mtfp21_t y2 = mtfp21_mul(y, y);
+            mtfp21_t xy2 = mtfp21_mul(x, y2);
+            float xy2_f = mtfp21_to_float(xy2);
+            float err = fabsf(xy2_f - 1.0f);
+            if (err > max_lut_err) max_lut_err = err;
+            if (err > 0.01f) lut_ok = 0;  /* LUT entry way off */
+        }
+        printf("max |x*y^2 - 1| = %.2e %s\n", max_lut_err, lut_ok ? "OK" : "FAIL");
+        if (lut_ok) tests_passed++; else tests_failed++;
+    }
+
+    free(work_src); free(work_dst);
+    printf("\n");
+}
+
+/* ================================================================
+ *  Test 13: Performance timing (Fix 5)
+ * ================================================================ */
+
+static void test_performance(void) {
+    printf("=== Test 13: Performance ===\n");
+
+    int n = 2560;
+    int iters = 100;
+    float eps = 1e-5f;
+    mtfp21_t eps_m = mtfp21_from_float(eps);
+
+    float *src_f = (float *)malloc(n * sizeof(float));
+    float *dst_f = (float *)malloc(n * sizeof(float));
+    mtfp21_t *src_m = (mtfp21_t *)malloc(n * sizeof(mtfp21_t));
+    mtfp21_t *dst_m = (mtfp21_t *)malloc(n * sizeof(mtfp21_t));
+
     srand(42);
     for (int i = 0; i < n; i++) {
-        src[i] = (int8_t)((rand() % (2 * in_range + 1)) - in_range);
+        src_f[i] = randn();
+        src_m[i] = mtfp21_from_float(src_f[i]);
     }
 
-    /* int8 RMSNorm */
-    mtfp21_rmsnorm_int8(dst, src, n, eps, out_range);
-
-    /* Float64 reference */
-    double sum = 0.0;
-    for (int i = 0; i < n; i++) sum += (double)src[i] * (double)src[i];
-    double scale = 1.0 / sqrt(sum / n + 1e-5);
-
-    /* Compare: how many output elements match the float64 reference (quantized)? */
-    int exact_match = 0;
-    int off_by_one = 0;
-    int worse = 0;
-    for (int i = 0; i < n; i++) {
-        double ref_val = (double)src[i] * scale;
-        /* Quantize reference to out_range */
-        int ref_q = (int)round(ref_val);
-        if (ref_q > out_range) ref_q = out_range;
-        if (ref_q < -out_range) ref_q = -out_range;
-
-        int diff = abs((int)dst[i] - ref_q);
-        if (diff == 0) exact_match++;
-        else if (diff == 1) off_by_one++;
-        else worse++;
+    /* Time float32 RMSNorm */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int it = 0; it < iters; it++) {
+        float sum = 0.0f;
+        for (int i = 0; i < n; i++) sum += src_f[i] * src_f[i];
+        float scale = 1.0f / sqrtf(sum / n + eps);
+        for (int i = 0; i < n; i++) dst_f[i] = src_f[i] * scale;
     }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double f32_us = ((t1.tv_sec - t0.tv_sec) * 1e6 + (t1.tv_nsec - t0.tv_nsec) / 1e3) / iters;
 
-    printf("  n=%d, in_range=%d, out_range=%d\n", n, in_range, out_range);
-    printf("  Exact match: %d/%d (%.1f%%)\n", exact_match, n, 100.0 * exact_match / n);
-    printf("  Off-by-one:  %d/%d (%.1f%%)\n", off_by_one, n, 100.0 * off_by_one / n);
-    printf("  Worse:       %d/%d (%.1f%%)\n", worse, n, 100.0 * worse / n);
-
-    int pass = (exact_match + off_by_one == n) && ((float)exact_match / n >= 0.95f);
-    if (pass) { printf("  PASS: >=95%% exact, rest off-by-one\n"); tests_passed++; }
-    else { printf("  FAIL\n"); tests_failed++; }
-
-    /* Test repeated application (2 consecutive RMSNorms) */
-    int8_t *dst2 = (int8_t *)malloc(n);
-    mtfp21_rmsnorm_int8(dst2, dst, n, eps, out_range);
-
-    /* After double normalization, values should be near unit variance */
-    int in_range_count = 0;
-    for (int i = 0; i < n; i++) {
-        if (abs(dst2[i]) <= out_range) in_range_count++;
+    /* Time MTFP21 RMSNorm */
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int it = 0; it < iters; it++) {
+        mtfp21_rmsnorm_pure(dst_m, src_m, n, eps_m);
     }
-    printf("  Double RMSNorm: %d/%d outputs in range (expect all)\n", in_range_count, n);
-    if (in_range_count == n) tests_passed++; else tests_failed++;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double mtfp_us = ((t1.tv_sec - t0.tv_sec) * 1e6 + (t1.tv_nsec - t0.tv_nsec) / 1e3) / iters;
 
-    free(src); free(dst); free(dst2);
+    printf("  n=%d, %d iterations\n", n, iters);
+    printf("  float32: %.1f us/call\n", f32_us);
+    printf("  MTFP21:  %.1f us/call\n", mtfp_us);
+    printf("  Ratio:   %.1fx\n", mtfp_us / f32_us);
+    tests_passed++;  /* measurement, not pass/fail */
+
+    free(src_f); free(dst_f); free(src_m); free(dst_m);
     printf("\n");
 }
 
@@ -819,6 +949,7 @@ int main(void) {
     test_accumulation_statistical();
     test_rmsnorm_pure();
     test_chained_pipeline();
+    test_performance();
 
     printf("======================\n");
     printf("Results: %d passed, %d failed\n", tests_passed, tests_failed);

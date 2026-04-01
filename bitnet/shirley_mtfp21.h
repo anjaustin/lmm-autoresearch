@@ -169,14 +169,13 @@ static inline int8_t mtfp21_to_int8(mtfp21_t a, int max_range) {
     if (exp == 0) {
         val = (int64_t)a.mantissa;
     } else if (exp > 0) {
-        /* Multiply mantissa by 3^exp */
-        if (exp < 32) {
-            val = (int64_t)a.mantissa * POW3[exp];
-        } else {
-            /* Overflow: clamp */
+        /* Multiply mantissa by 3^exp, guarding against int64 overflow */
+        int64_t abs_m = (int64_t)(a.mantissa > 0 ? a.mantissa : -a.mantissa);
+        if (exp >= 32 || abs_m > INT64_MAX / POW3[exp]) {
             val = (a.mantissa > 0) ? max_range : -max_range;
             goto clamp;
         }
+        val = (int64_t)a.mantissa * POW3[exp];
     } else {
         /* Divide mantissa by 3^(-exp), with rounding */
         int neg_exp = -exp;
@@ -580,10 +579,11 @@ static inline void mtfp21_rmsnorm(
     /* Step 4: rsqrt (integer-only LUT + NR) */
     mtfp21_t scale = mtfp21_rsqrt(mean_eps);
 
-    /* Step 5: apply scale and convert back to float */
-    float scale_f = mtfp21_to_float(scale);
+    /* Step 5: apply scale via MTFP21 multiply, convert to float at output */
     for (int i = 0; i < n; i++) {
-        dst[i] = src[i] * scale_f;
+        mtfp21_t xi = mtfp21_from_float(src[i]);
+        mtfp21_t yi = mtfp21_mul(xi, scale);
+        dst[i] = mtfp21_to_float(yi);
     }
 }
 
@@ -629,21 +629,18 @@ static inline void mtfp21_rmsnorm_int8(
     const int8_t * restrict src,
     int n,
     mtfp21_t eps,
-    int out_range   /* output clamp range, e.g. 121 for 5-trit, 40 for 4-trit */
+    int out_range,          /* output clamp range, e.g. 121 for 5-trit */
+    mtfp21_t *work_src,     /* caller-provided workspace, n elements */
+    mtfp21_t *work_dst      /* caller-provided workspace, n elements */
 ) {
-    /* Convert int8 → MTFP21, compute RMSNorm, convert back to int8 */
-    /* Allocate MTFP21 temp buffers on stack (n * 5 bytes each) */
-    mtfp21_t *src_m = (mtfp21_t *)__builtin_alloca(n * sizeof(mtfp21_t));
-    mtfp21_t *dst_m = (mtfp21_t *)__builtin_alloca(n * sizeof(mtfp21_t));
-
     for (int i = 0; i < n; i++) {
-        src_m[i] = mtfp21_from_int8(src[i]);
+        work_src[i] = mtfp21_from_int8(src[i]);
     }
 
-    mtfp21_rmsnorm_pure(dst_m, src_m, n, eps);
+    mtfp21_rmsnorm_pure(work_dst, work_src, n, eps);
 
     for (int i = 0; i < n; i++) {
-        dst[i] = mtfp21_to_int8(dst_m[i], out_range);
+        dst[i] = mtfp21_to_int8(work_dst[i], out_range);
     }
 }
 
