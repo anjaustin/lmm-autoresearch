@@ -344,8 +344,8 @@ int main(void) {
             src[i] = (int8_t)((rand() % 161) - 80);
         }
 
-        /* Ternary kernel (zero float) */
-        shirley_rmsnorm_ternary(dst_ternary, src, n, out_range);
+        /* Ternary kernel (zero float), no gamma */
+        shirley_rmsnorm_ternary(dst_ternary, src, NULL, n, out_range);
 
         /* Float64 reference */
         double sum_sq = 0.0;
@@ -377,7 +377,7 @@ int main(void) {
 
         clock_gettime(CLOCK_MONOTONIC, &t0);
         for (int it = 0; it < iters; it++) {
-            shirley_rmsnorm_ternary(dst_ternary, src, n, out_range);
+            shirley_rmsnorm_ternary(dst_ternary, src, NULL, n, out_range);
         }
         clock_gettime(CLOCK_MONOTONIC, &t1);
         double ternary_ns = elapsed_us(t0, t1) * 1000.0 / iters;
@@ -413,19 +413,103 @@ int main(void) {
         printf("  ternary vs MTFP21:       %.0fx faster\n", mtfp_ns / ternary_ns);
         tests_passed++;
 
-        /* Verify output matches float hybrid (both should agree with reference) */
-        ternary_rmsnorm_avx2(dst_legacy, src, n, 1e-5f, out_range);
-        int match = 0;
-        for (int i = 0; i < n; i++) {
-            if (dst_ternary[i] == dst_legacy[i]) match++;
+        free(src_m); free(dst_m);
+
+        /* ---- Adversarial cases on ternary kernel (Fix 3) ---- */
+        printf("\n  --- Adversarial (ternary kernel) ---\n");
+
+        struct { const char *name; void (*fill)(int8_t *, int); } adv_cases[] = {
+            {"all_zeros", NULL},
+            {"all_same_40", NULL},
+            {"single_nonzero", NULL},
+            {"alternating_max", NULL},
+            {"small_values", NULL},
+        };
+
+        for (int tc = 0; tc < 5; tc++) {
+            memset(src, 0, n);
+            switch (tc) {
+            case 0: /* all zeros */
+                break;
+            case 1: /* all same */
+                memset(src, 40, n);
+                break;
+            case 2: /* single nonzero — THE Q15 overflow case */
+                src[0] = 80;
+                break;
+            case 3: /* alternating max */
+                for (int j = 0; j < n; j++) src[j] = (j % 2) ? 80 : -80;
+                break;
+            case 4: /* small values — scale > 1.0 */
+                for (int j = 0; j < n; j++) src[j] = (j % 3) - 1; /* {-1, 0, 1} */
+                break;
+            }
+
+            shirley_rmsnorm_ternary(dst_ternary, src, NULL, n, out_range);
+
+            /* Reference */
+            double ss = 0.0;
+            for (int j = 0; j < n; j++) ss += (double)src[j] * (double)src[j];
+            double sc = 1.0 / sqrt(ss / n + 1e-5);
+
+            int tc_worse = 0;
+            int tc_maxdiff = 0;
+            for (int j = 0; j < n; j++) {
+                int rq = (int)round((double)src[j] * sc);
+                if (rq > out_range) rq = out_range;
+                if (rq < -out_range) rq = -out_range;
+                int diff = abs((int)dst_ternary[j] - rq);
+                if (diff > tc_maxdiff) tc_maxdiff = diff;
+                if (diff > 1) tc_worse++;
+            }
+
+            const char *names[] = {"all_zeros","all_same_40","single_nonzero","alternating","small_values"};
+            int ok = (tc_worse == 0);
+            printf("  %-18s: worse=%d maxdiff=%d %s\n", names[tc], tc_worse, tc_maxdiff, ok ? "OK" : "FAIL");
+            if (ok) tests_passed++; else tests_failed++;
         }
-        printf("  ternary vs float-hybrid agreement: %d/%d (%.1f%%)\n",
-               match, n, 100.0*match/n);
-        if ((float)match / n >= 0.95f) { printf("  PASS\n"); tests_passed++; }
-        else { printf("  FAIL\n"); tests_failed++; }
+
+        /* ---- Gamma test (Fix 1) ---- */
+        printf("\n  --- Gamma weights ---\n");
+        {
+            int16_t *gamma_q14 = (int16_t *)malloc(n * sizeof(int16_t));
+            srand(42);
+            for (int j = 0; j < n; j++) {
+                src[j] = (int8_t)((rand() % 161) - 80);
+                /* gamma near 1.0 with variance, in Q14 */
+                float gf = 0.8f + (float)(rand() % 100) / 250.0f;  /* [0.8, 1.2] */
+                gamma_q14[j] = (int16_t)(gf * SHIRLEY_GAMMA_SCALE);
+            }
+
+            shirley_rmsnorm_ternary(dst_ternary, src, gamma_q14, n, out_range);
+
+            /* Reference with gamma */
+            double ss = 0.0;
+            for (int j = 0; j < n; j++) ss += (double)src[j] * (double)src[j];
+            double sc = 1.0 / sqrt(ss / n + 1e-5);
+
+            int g_exact = 0, g_off1 = 0, g_worse = 0;
+            for (int j = 0; j < n; j++) {
+                double gval = (double)gamma_q14[j] / SHIRLEY_GAMMA_SCALE;
+                int rq = (int)round((double)src[j] * sc * gval);
+                if (rq > out_range) rq = out_range;
+                if (rq < -out_range) rq = -out_range;
+                int diff = abs((int)dst_ternary[j] - rq);
+                if (diff == 0) g_exact++;
+                else if (diff == 1) g_off1++;
+                else g_worse++;
+            }
+            printf("  with gamma: Exact=%d (%.1f%%), Off-by-1=%d, Worse=%d\n",
+                   g_exact, 100.0*g_exact/n, g_off1, g_worse);
+            /* Two-stage fixed-point (scale × gamma) accumulates rounding.
+             * 85% exact with rest off-by-1 is the expected precision. */
+            int gpass = (g_worse == 0) && ((float)g_exact / n >= 0.85f);
+            if (gpass) { printf("  PASS\n"); tests_passed++; }
+            else { printf("  FAIL\n"); tests_failed++; }
+            free(gamma_q14);
+        }
 
         free(src); free(dst_ternary); free(dst_legacy);
-        free(src_m); free(dst_m);
     }
 
     printf("\n==============================\n");

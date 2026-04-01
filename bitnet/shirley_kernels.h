@@ -164,9 +164,17 @@ static float shirley_rmsnorm_quantize(
  *    Phase 5:   AVX2 int16 × int16 → int16, shift, pack → int8
  * ================================================================ */
 
+/* gamma_q15: per-element gamma weights in Q15 fixed-point (int16).
+ * Precompute from float gamma: gamma_q15[i] = round(gamma[i] * 16384).
+ * Pass NULL to skip gamma (equivalent to gamma=1.0 everywhere).
+ * Using Q14 (16384) instead of Q15 (32768) to leave headroom for gamma > 1.0. */
+#define SHIRLEY_GAMMA_SHIFT 14
+#define SHIRLEY_GAMMA_SCALE (1 << SHIRLEY_GAMMA_SHIFT)
+
 static void shirley_rmsnorm_ternary(
-    int8_t       * restrict dst,
-    const int8_t * restrict src,
+    int8_t        * restrict dst,
+    const int8_t  * restrict src,
+    const int16_t * restrict gamma_q14,  /* Q14 gamma, or NULL */
     int           n,
     int           out_range   /* output clamp, e.g. 80 for 5-trit */
 ) {
@@ -214,93 +222,137 @@ static void shirley_rmsnorm_ternary(
 
     mtfp21_t m_scale = mtfp21_rsqrt(m_mean_eps);
 
-    /* ---- Phase 4: Convert MTFP21 scale to Q15 fixed-point ----
+    /* ---- Phase 4: Convert MTFP21 scale to split fixed-point ----
      *
-     * We need: dst[i] = clamp(round(src[i] * scale), ±out_range)
-     * where scale = m_scale.mantissa * 3^(m_scale.exponent)
+     * The scale = mantissa * 3^exponent can be arbitrarily large or small.
+     * Q15 overflows when scale > 1.0 (low-RMS inputs).
      *
-     * Strategy: represent scale as (numerator / denominator) where both
-     * are integers, then compute (src[i] * numerator + denominator/2) / denominator.
+     * Fix: split into mantissa multiply and exponent shift.
+     *   result = (src[i] * norm_mantissa) >> (norm_shift)
      *
-     * For AVX2: use Q15 format. scale_q15 = round(scale * 32768).
-     * Then: result = (int16(src[i]) * scale_q15) >> 15.
+     * We normalize the MTFP21 mantissa into Q15 range [0, 32767] and
+     * track the remaining power-of-3 as an integer shift via a
+     * precomputed multiplier.
      *
-     * Computing scale_q15 from MTFP21 without float:
-     *   scale = mantissa * 3^exponent
-     *   scale_q15 = mantissa * 3^exponent * 32768
-     *             = mantissa * 32768 * 3^exponent  (if exponent >= 0)
-     *             = (mantissa * 32768) / 3^(-exponent)  (if exponent < 0)
+     * Strategy: evaluate scale as a rational number:
+     *   scale_numer = mantissa (int32)
+     *   scale_denom = 3^(-exponent) if exponent < 0, else 1
+     *   scale_extra = 3^exponent if exponent >= 0, else 1
+     *
+     * Then: result = (src[i] * scale_numer * scale_extra) / scale_denom
+     *
+     * For SIMD: precompute a Q-format multiplier at whatever shift
+     * gives us full int16 range. Use _mm256_mulhi_epi16 (gives >>16)
+     * or _mm256_mullo_epi16 + shift, depending on scale magnitude.
      */
-    int64_t scale_q15;
-    int exp = m_scale.exponent;
-    if (exp >= 0) {
-        scale_q15 = (int64_t)m_scale.mantissa * 32768;
-        if (exp < 32) scale_q15 *= POW3[exp];
-        /* For very large scales, this could overflow. In practice,
-         * rsqrt of a mean is O(1), so the scale is moderate. */
-    } else {
-        int neg_exp = -exp;
-        if (neg_exp < 32) {
-            /* (mantissa * 32768 + POW3[neg_exp]/2) / POW3[neg_exp] — rounded */
-            int64_t num = (int64_t)m_scale.mantissa * 32768;
-            int64_t den = POW3[neg_exp];
-            scale_q15 = (num + den / 2) / den;
+
+    /* Convert MTFP21 scale to a single int32 numerator/denominator pair.
+     * scale_value = numer / denom, both positive integers. */
+    int32_t scale_mant = m_scale.mantissa;
+    int scale_exp = m_scale.exponent;
+
+    /* We need: dst[i] = round(src[i] * scale_mant * 3^scale_exp)
+     * clamped to ±out_range.
+     *
+     * Compute as: dst[i] = round(src[i] * multiplier / divisor)
+     * where multiplier and divisor are chosen so the intermediate
+     * fits in int32 and the result has good precision.
+     *
+     * If scale_exp >= 0: multiplier = scale_mant * 3^scale_exp, divisor = 1
+     *   But this can overflow. Instead: find the right shift.
+     * If scale_exp < 0:  multiplier = scale_mant, divisor = 3^(-scale_exp)
+     *
+     * For the SIMD path: use int32 multiply (widen int16→int32, multiply,
+     * shift right, pack back). This handles arbitrary scale magnitudes.
+     */
+
+    /* Compute the scale as a ratio: (numer, denom) such that
+     * scale = numer / denom and both fit in int32.
+     * Then: result = (src[i] * numer + denom/2) / denom */
+    int64_t numer, denom;
+    if (scale_exp >= 0) {
+        if (scale_exp < 20) {
+            numer = (int64_t)scale_mant * POW3[scale_exp];
         } else {
-            scale_q15 = 0;
+            numer = (int64_t)scale_mant; /* overflow protection */
+            /* scale is huge — everything clamps to out_range */
         }
+        denom = 1;
+    } else {
+        int neg_exp = -scale_exp;
+        numer = (int64_t)scale_mant;
+        denom = (neg_exp < 32) ? POW3[neg_exp] : INT64_MAX;
     }
 
-    /* Clamp scale_q15 to int16 range for SIMD multiply */
-    if (scale_q15 > 32767) scale_q15 = 32767;
-    if (scale_q15 < -32767) scale_q15 = -32767;
-    int16_t sq15 = (int16_t)scale_q15;
-
-    /* ---- Phase 5: Scale via AVX2 integer multiply + shift ----
+    /* ---- Phase 5: Scale via integer multiply + divide ----
      *
-     * For each element: dst = clamp((int16(src) * sq15 + 16384) >> 15, ±out_range)
-     * The +16384 is rounding (half of 32768).
+     * For each element:
+     *   int32_t product = (int32_t)src[i] * numer;
+     *   int32_t result = (product + denom/2) / denom;  // rounded
+     *   clamp to ±out_range
      *
-     * _mm256_mullo_epi16: 16-bit × 16-bit → low 16 bits (NOT what we want)
-     * _mm256_mulhi_epi16: 16-bit × 16-bit → high 16 bits (= result >> 16)
+     * SIMD: widen int8→int16, multiply by int16 portion of numer,
+     * then handle the denominator shift. For the common case
+     * (scale < 1, denom is a power of 3), this is efficient.
      *
-     * For Q15: we want result >> 15. Use mulhi (gives >>16) then adjust:
-     * Actually, use: _mm256_mulhrs_epi16 which computes
-     *   round((a * b) >> 14) / 2 = round((a * b) >> 15)
-     * This is EXACTLY the Q15 multiply-round-shift we need!
+     * For now: use scalar int32 multiply to be correct-first.
+     * The SIMD hot path is Phase 1+2 (sum of squares) anyway.
      */
-    __m256i vscale_q15 = _mm256_set1_epi16(sq15);
-    __m256i vclamp_pos = _mm256_set1_epi8((int8_t)(out_range > 127 ? 127 : out_range));
-    __m256i vclamp_neg = _mm256_set1_epi8((int8_t)(out_range > 127 ? -128 : -out_range));
 
-    for (i = 0; i + 32 <= n; i += 32) {
-        __m256i v = _mm256_loadu_si256((const __m256i *)(src + i));
+    /* Compute a single Q15 multiplier that combines scale and denominator.
+     * combined_q15 = round(numer * 32768 / denom).
+     * If this fits in int16, we use the fast SIMD path.
+     * If not, fall back to scalar int64 division. */
+    int64_t combined_q15 = (numer * 32768 + denom / 2) / denom;
+    int use_fast_path = (combined_q15 >= -32767 && combined_q15 <= 32767);
 
-        /* Widen int8 → int16 */
-        __m256i lo16 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(v));
-        __m256i hi16 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(v, 1));
+    if (use_fast_path && !gamma_q14) {
+        /* ---- Fast SIMD path (common case: scale < 1.0, no gamma) ---- */
+        int16_t sq15 = (int16_t)combined_q15;
+        __m256i vscale_q15 = _mm256_set1_epi16(sq15);
+        __m256i vclamp_pos = _mm256_set1_epi8((int8_t)(out_range > 127 ? 127 : out_range));
+        __m256i vclamp_neg = _mm256_set1_epi8((int8_t)(out_range > 127 ? -128 : -out_range));
 
-        /* Q15 multiply-round-shift: round((a * b) >> 15) */
-        __m256i r_lo = _mm256_mulhrs_epi16(lo16, vscale_q15);
-        __m256i r_hi = _mm256_mulhrs_epi16(hi16, vscale_q15);
+        for (i = 0; i + 32 <= n; i += 32) {
+            __m256i v = _mm256_loadu_si256((const __m256i *)(src + i));
+            __m256i lo16 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(v));
+            __m256i hi16 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(v, 1));
+            __m256i r_lo = _mm256_mulhrs_epi16(lo16, vscale_q15);
+            __m256i r_hi = _mm256_mulhrs_epi16(hi16, vscale_q15);
+            __m256i r8 = _mm256_packs_epi16(r_lo, r_hi);
+            r8 = _mm256_permute4x64_epi64(r8, 0xD8);
+            r8 = _mm256_max_epi8(r8, vclamp_neg);
+            r8 = _mm256_min_epi8(r8, vclamp_pos);
+            _mm256_storeu_si256((__m256i *)(dst + i), r8);
+        }
+        for (; i < n; i++) {
+            int32_t r = ((int32_t)src[i] * (int32_t)sq15 + 16384) >> 15;
+            if (r > out_range) r = out_range;
+            if (r < -out_range) r = -out_range;
+            dst[i] = (int8_t)r;
+        }
+    } else {
+        /* ---- Scalar path (overflow case, or gamma applied) ---- */
+        int64_t half_denom = denom / 2;
 
-        /* Pack int16 → int8 with saturation */
-        __m256i r8 = _mm256_packs_epi16(r_lo, r_hi);
-        /* Fix lane ordering from packs */
-        r8 = _mm256_permute4x64_epi64(r8, 0xD8);
+        for (i = 0; i < n; i++) {
+            int64_t product = (int64_t)src[i] * numer;
+            int32_t scaled;
+            if (product >= 0) {
+                scaled = (int32_t)((product + half_denom) / denom);
+            } else {
+                scaled = (int32_t)(-((-product + half_denom) / denom));
+            }
 
-        /* Clamp to ±out_range */
-        r8 = _mm256_max_epi8(r8, vclamp_neg);
-        r8 = _mm256_min_epi8(r8, vclamp_pos);
+            /* Apply gamma if provided (Q14 fixed-point) */
+            if (gamma_q14) {
+                scaled = (scaled * (int32_t)gamma_q14[i] + (SHIRLEY_GAMMA_SCALE / 2)) >> SHIRLEY_GAMMA_SHIFT;
+            }
 
-        _mm256_storeu_si256((__m256i *)(dst + i), r8);
-    }
-
-    /* Tail */
-    for (; i < n; i++) {
-        int32_t r = ((int32_t)src[i] * (int32_t)sq15 + 16384) >> 15;
-        if (r > out_range) r = out_range;
-        if (r < -out_range) r = -out_range;
-        dst[i] = (int8_t)r;
+            if (scaled > out_range) scaled = out_range;
+            if (scaled < -out_range) scaled = -out_range;
+            dst[i] = (int8_t)scaled;
+        }
     }
 }
 
