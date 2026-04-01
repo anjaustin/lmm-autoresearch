@@ -17,16 +17,140 @@
 #include <immintrin.h>
 
 /* ================================================================
- *  ternary_rmsnorm_avx2 — Integer RMSNorm for ternary pipeline
+ *  Shirley RMSNorm — hybrid AVX2/FPU kernel for ternary pipeline
  *
- *  Input:  int8 activations from matmul (range ±in_range)
- *  Output: int8 normalized activations (range ±out_range)
+ *  Two variants:
+ *    1. float32→float32 (drop-in for ggml_compute_forward_rms_norm_f32)
+ *    2. float32→int8 (fused normalize + quantize for matmul input)
  *
- *  Per-element work: AVX2 integer (Layer 1)
- *  Scalar rsqrt: FPU float (Layer 2)
+ *  Architecture:
+ *    Phase 1+2: sum of squares — AVX2 float (matches input format)
+ *    Phase 3:   rsqrt — FPU scalar, one call
+ *    Phase 4:   scale × gamma — AVX2 float, fused multiply
+ *    Phase 5:   (variant 2 only) quantize to int8 — AVX2 pack
  *
- *  y[i] = clamp(round(x[i] / rms(x) * out_range / in_range), ±out_range)
- *  where rms(x) = sqrt(mean(x^2) + eps)
+ *  Naming: "hybrid" not "integer" — honest about using FPU where native.
+ * ================================================================ */
+
+/* Variant 1: float32 → float32 with gamma weights.
+ * Drop-in replacement for ggml_compute_forward_rms_norm_f32 + gamma mul.
+ * y[i] = x[i] * rsqrt(mean(x^2) + eps) * gamma[i] */
+static void shirley_rmsnorm_f32(
+    float       * restrict dst,
+    const float * restrict src,
+    const float * restrict gamma,  /* per-element weight, NULL to skip */
+    int           n,
+    float         eps
+) {
+    /* Phase 1+2: Sum of squares in AVX2 float */
+    __m256 acc = _mm256_setzero_ps();
+    int i;
+
+    for (i = 0; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(src + i);
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(v, v));
+    }
+
+    /* Horizontal sum */
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 sum4 = _mm_add_ps(lo, hi);
+    sum4 = _mm_hadd_ps(sum4, sum4);
+    sum4 = _mm_hadd_ps(sum4, sum4);
+    float sum_sq;
+    _mm_store_ss(&sum_sq, sum4);
+
+    /* Tail */
+    for (; i < n; i++) sum_sq += src[i] * src[i];
+
+    /* Phase 3: Scalar rsqrt */
+    float scale = 1.0f / sqrtf(sum_sq / (float)n + eps);
+
+    /* Phase 4: Scale with optional gamma */
+    if (gamma) {
+        __m256 vscale = _mm256_set1_ps(scale);
+        for (i = 0; i + 8 <= n; i += 8) {
+            __m256 v = _mm256_loadu_ps(src + i);
+            __m256 g = _mm256_loadu_ps(gamma + i);
+            __m256 r = _mm256_mul_ps(_mm256_mul_ps(v, vscale), g);
+            _mm256_storeu_ps(dst + i, r);
+        }
+        for (; i < n; i++) dst[i] = src[i] * scale * gamma[i];
+    } else {
+        __m256 vscale = _mm256_set1_ps(scale);
+        for (i = 0; i + 8 <= n; i += 8) {
+            __m256 v = _mm256_loadu_ps(src + i);
+            _mm256_storeu_ps(dst + i, _mm256_mul_ps(v, vscale));
+        }
+        for (; i < n; i++) dst[i] = src[i] * scale;
+    }
+}
+
+/* Variant 2: float32 → int8 with gamma weights.
+ * Fused RMSNorm + gamma + quantize for the ternary matmul pipeline.
+ * y[i] = clamp(round(x[i] * rsqrt(mean(x^2)+eps) * gamma[i] * quant_scale), ±out_range)
+ * Returns the quantization scale (for dequantization after matmul). */
+static float shirley_rmsnorm_quantize(
+    int8_t       * restrict dst,
+    const float  * restrict src,
+    const float  * restrict gamma,  /* per-element weight, NULL to skip */
+    int           n,
+    float         eps,
+    int           out_range   /* output clamp, e.g. 80 for 5-trit */
+) {
+    /* Phase 1+2+3: Same as variant 1 — compute scale */
+    __m256 acc = _mm256_setzero_ps();
+    int i;
+
+    for (i = 0; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(src + i);
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(v, v));
+    }
+
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 sum4 = _mm_add_ps(lo, hi);
+    sum4 = _mm_hadd_ps(sum4, sum4);
+    sum4 = _mm_hadd_ps(sum4, sum4);
+    float sum_sq;
+    _mm_store_ss(&sum_sq, sum4);
+    for (; i < n; i++) sum_sq += src[i] * src[i];
+
+    float norm_scale = 1.0f / sqrtf(sum_sq / (float)n + eps);
+
+    /* Phase 4: Apply norm + gamma, find max for quantization scale */
+    float *tmp = (float *)__builtin_alloca(n * sizeof(float));
+    float max_abs = 0.0f;
+
+    if (gamma) {
+        for (i = 0; i < n; i++) {
+            tmp[i] = src[i] * norm_scale * gamma[i];
+            float a = fabsf(tmp[i]);
+            if (a > max_abs) max_abs = a;
+        }
+    } else {
+        for (i = 0; i < n; i++) {
+            tmp[i] = src[i] * norm_scale;
+            float a = fabsf(tmp[i]);
+            if (a > max_abs) max_abs = a;
+        }
+    }
+
+    /* Phase 5: Quantize to int8 */
+    float quant_scale = (max_abs > 1e-10f) ? (float)out_range / max_abs : 0.0f;
+
+    for (i = 0; i < n; i++) {
+        int32_t r = (int32_t)roundf(tmp[i] * quant_scale);
+        if (r > out_range) r = out_range;
+        if (r < -out_range) r = -out_range;
+        dst[i] = (int8_t)r;
+    }
+
+    return quant_scale;  /* caller needs this to dequantize after matmul */
+}
+
+/* ================================================================
+ *  Legacy: int8→int8 RMSNorm (no gamma, for backward compat)
  * ================================================================ */
 
 static void ternary_rmsnorm_avx2(
@@ -34,7 +158,7 @@ static void ternary_rmsnorm_avx2(
     const int8_t * restrict src,
     int           n,
     float         eps,
-    int           out_range   /* output clamp, e.g. 80 for 5-trit */
+    int           out_range
 ) {
     /* ---- Phase 1+2: Sum of squares in AVX2 integer ----
      *

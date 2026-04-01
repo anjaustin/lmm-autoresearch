@@ -27,36 +27,98 @@ static double elapsed_us(struct timespec t0, struct timespec t1) {
 }
 
 /* ================================================================
- *  Test 1: Correctness against float64 reference
+ *  Test 1: float32→float32 RMSNorm with gamma (the real operation)
  * ================================================================ */
 
-static void test_correctness(void) {
-    printf("=== Test 1: AVX2 RMSNorm correctness ===\n");
+static void test_f32_with_gamma(void) {
+    printf("=== Test 1: shirley_rmsnorm_f32 with gamma ===\n");
 
     int n = 2560;
-    int in_range = 80;
-    int out_range = 80;
     float eps = 1e-5f;
-
-    int8_t *src = (int8_t *)malloc(n);
-    int8_t *dst = (int8_t *)malloc(n);
+    float *src = (float *)malloc(n * sizeof(float));
+    float *gamma_w = (float *)malloc(n * sizeof(float));
+    float *dst = (float *)malloc(n * sizeof(float));
 
     srand(42);
     for (int i = 0; i < n; i++) {
-        src[i] = (int8_t)((rand() % (2 * in_range + 1)) - in_range);
+        src[i] = randn();
+        gamma_w[i] = 0.5f + randn() * 0.1f;  /* realistic gamma: near 1.0 with variance */
     }
 
-    /* AVX2 kernel */
-    ternary_rmsnorm_avx2(dst, src, n, eps, out_range);
+    /* Shirley kernel */
+    shirley_rmsnorm_f32(dst, src, gamma_w, n, eps);
 
     /* Float64 reference */
     double sum_sq = 0.0;
     for (int i = 0; i < n; i++) sum_sq += (double)src[i] * (double)src[i];
     double scale = 1.0 / sqrt(sum_sq / n + eps);
 
+    float max_err = 0.0f;
+    for (int i = 0; i < n; i++) {
+        double ref = (double)src[i] * scale * (double)gamma_w[i];
+        float err = fabsf(ref) > 1e-10 ? fabsf((dst[i] - (float)ref) / (float)ref) : fabsf(dst[i]);
+        if (err > max_err) max_err = err;
+    }
+
+    printf("  n=%d, with gamma, max_err=%.2e\n", n, max_err);
+    if (max_err < 1e-5f) { printf("  PASS\n"); tests_passed++; }
+    else { printf("  FAIL\n"); tests_failed++; }
+
+    /* Without gamma */
+    shirley_rmsnorm_f32(dst, src, NULL, n, eps);
+    max_err = 0.0f;
+    for (int i = 0; i < n; i++) {
+        double ref = (double)src[i] * scale;
+        float err = fabsf(ref) > 1e-10 ? fabsf((dst[i] - (float)ref) / (float)ref) : fabsf(dst[i]);
+        if (err > max_err) max_err = err;
+    }
+    printf("  Without gamma: max_err=%.2e\n", max_err);
+    if (max_err < 1e-6f) { printf("  PASS\n"); tests_passed++; }
+    else { printf("  FAIL\n"); tests_failed++; }
+
+    free(src); free(gamma_w); free(dst);
+}
+
+/* ================================================================
+ *  Test 1b: float32→int8 fused RMSNorm+quantize with gamma
+ * ================================================================ */
+
+static void test_fused_quantize(void) {
+    printf("=== Test 1b: shirley_rmsnorm_quantize (float32→int8) ===\n");
+
+    int n = 2560;
+    float eps = 1e-5f;
+    int out_range = 80;
+    float *src = (float *)malloc(n * sizeof(float));
+    float *gamma_w = (float *)malloc(n * sizeof(float));
+    int8_t *dst = (int8_t *)malloc(n);
+
+    /* Use small-variance inputs so output spans the quantization range */
+    srand(42);
+    for (int i = 0; i < n; i++) {
+        src[i] = randn() * 0.1f;  /* small inputs → large scale → wider output */
+        gamma_w[i] = 0.8f + randn() * 0.2f;
+    }
+
+    float quant_scale = shirley_rmsnorm_quantize(dst, src, gamma_w, n, eps, out_range);
+
+    /* Float64 reference */
+    double sum_sq = 0.0;
+    for (int i = 0; i < n; i++) sum_sq += (double)src[i] * (double)src[i];
+    double norm_scale = 1.0 / sqrt(sum_sq / n + eps);
+
+    /* Compute reference normalized+gamma values, find max for quant */
+    double *ref_norm = (double *)malloc(n * sizeof(double));
+    double ref_max = 0.0;
+    for (int i = 0; i < n; i++) {
+        ref_norm[i] = (double)src[i] * norm_scale * (double)gamma_w[i];
+        if (fabs(ref_norm[i]) > ref_max) ref_max = fabs(ref_norm[i]);
+    }
+    double ref_qscale = (ref_max > 1e-10) ? out_range / ref_max : 0.0;
+
     int exact = 0, off1 = 0, worse = 0;
     for (int i = 0; i < n; i++) {
-        int ref_q = (int)round((double)src[i] * scale);
+        int ref_q = (int)round(ref_norm[i] * ref_qscale);
         if (ref_q > out_range) ref_q = out_range;
         if (ref_q < -out_range) ref_q = -out_range;
 
@@ -66,14 +128,22 @@ static void test_correctness(void) {
         else worse++;
     }
 
+    /* Count distinct output values (stress test: should be >> 5) */
+    int histogram[256] = {0};
+    for (int i = 0; i < n; i++) histogram[dst[i] + 128]++;
+    int distinct = 0;
+    for (int i = 0; i < 256; i++) if (histogram[i] > 0) distinct++;
+
     printf("  Exact: %d/%d (%.1f%%), Off-by-1: %d, Worse: %d\n",
            exact, n, 100.0 * exact / n, off1, worse);
+    printf("  Distinct output values: %d (stress check: should be >> 5)\n", distinct);
+    printf("  quant_scale=%.4f\n", quant_scale);
 
-    if (worse == 0 && (float)exact / n >= 0.95f) {
-        printf("  PASS\n"); tests_passed++;
-    } else {
-        printf("  FAIL\n"); tests_failed++;
-    }
+    int pass = (worse == 0) && ((float)exact / n >= 0.95f) && (distinct > 20);
+    if (pass) { printf("  PASS\n"); tests_passed++; }
+    else { printf("  FAIL\n"); tests_failed++; }
+
+    free(src); free(gamma_w); free(dst); free(ref_norm);
 }
 
 /* ================================================================
@@ -134,71 +204,66 @@ static void test_dimensions(void) {
  * ================================================================ */
 
 static void test_performance(void) {
-    printf("=== Test 3: Performance ===\n");
+    printf("=== Test 3: Performance (fair comparison) ===\n");
 
     int n = 2560;
     int iters = 10000;
     float eps = 1e-5f;
 
-    int8_t *src = (int8_t *)malloc(n);
-    int8_t *dst = (int8_t *)malloc(n);
     float *src_f = (float *)malloc(n * sizeof(float));
     float *dst_f = (float *)malloc(n * sizeof(float));
-    mtfp21_t *src_m = (mtfp21_t *)malloc(n * sizeof(mtfp21_t));
-    mtfp21_t *dst_m = (mtfp21_t *)malloc(n * sizeof(mtfp21_t));
-    mtfp21_t eps_m = mtfp21_from_float(eps);
+    float *gamma_w = (float *)malloc(n * sizeof(float));
+    int8_t *dst_i8 = (int8_t *)malloc(n);
 
     srand(42);
     for (int i = 0; i < n; i++) {
-        src[i] = (int8_t)((rand() % 161) - 80);
-        src_f[i] = (float)src[i];
-        src_m[i] = mtfp21_from_float(src_f[i]);
+        src_f[i] = randn();
+        gamma_w[i] = 0.8f + randn() * 0.2f;
     }
 
     struct timespec t0, t1;
 
-    /* AVX2 integer kernel */
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    for (int it = 0; it < iters; it++) {
-        ternary_rmsnorm_avx2(dst, src, n, eps, 80);
-    }
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double avx2_ns = elapsed_us(t0, t1) * 1000.0 / iters;
-
-    /* Float32 RMSNorm */
+    /* Baseline: scalar float32 RMSNorm + gamma (what ggml does today) */
     clock_gettime(CLOCK_MONOTONIC, &t0);
     for (int it = 0; it < iters; it++) {
         float sum = 0.0f;
         for (int i = 0; i < n; i++) sum += src_f[i] * src_f[i];
         float sc = 1.0f / sqrtf(sum / n + eps);
-        for (int i = 0; i < n; i++) dst_f[i] = src_f[i] * sc;
+        for (int i = 0; i < n; i++) dst_f[i] = src_f[i] * sc * gamma_w[i];
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    double f32_ns = elapsed_us(t0, t1) * 1000.0 / iters;
+    double scalar_ns = elapsed_us(t0, t1) * 1000.0 / iters;
 
-    /* MTFP21 RMSNorm */
-    int mtfp_iters = 100;  /* fewer iters — it's slow */
+    /* Shirley: AVX2 float32→float32 with gamma */
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    for (int it = 0; it < mtfp_iters; it++) {
-        mtfp21_rmsnorm_pure(dst_m, src_m, n, eps_m);
+    for (int it = 0; it < iters; it++) {
+        shirley_rmsnorm_f32(dst_f, src_f, gamma_w, n, eps);
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    double mtfp_ns = elapsed_us(t0, t1) * 1000.0 / mtfp_iters;
+    double shirley_f32_ns = elapsed_us(t0, t1) * 1000.0 / iters;
 
-    printf("  n=%d\n", n);
-    printf("  %-20s %10.0f ns/call\n", "AVX2 integer:", avx2_ns);
-    printf("  %-20s %10.0f ns/call\n", "float32:", f32_ns);
-    printf("  %-20s %10.0f ns/call\n", "MTFP21:", mtfp_ns);
+    /* Shirley: AVX2 float32→int8 fused (norm+gamma+quantize) */
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int it = 0; it < iters; it++) {
+        shirley_rmsnorm_quantize(dst_i8, src_f, gamma_w, n, eps, 80);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double shirley_quant_ns = elapsed_us(t0, t1) * 1000.0 / iters;
+
+    printf("  n=%d, all with gamma weights, float32 input\n", n);
+    printf("  %-35s %8.0f ns/call\n", "scalar float32 (ggml baseline):", scalar_ns);
+    printf("  %-35s %8.0f ns/call\n", "shirley_rmsnorm_f32 (AVX2):", shirley_f32_ns);
+    printf("  %-35s %8.0f ns/call\n", "shirley_rmsnorm_quantize (fused):", shirley_quant_ns);
     printf("\n");
-    printf("  AVX2 vs float32:   %.1fx %s\n",
-           f32_ns > avx2_ns ? f32_ns / avx2_ns : avx2_ns / f32_ns,
-           f32_ns > avx2_ns ? "faster" : "slower");
-    printf("  AVX2 vs MTFP21:    %.0fx faster\n", mtfp_ns / avx2_ns);
-    printf("  float32 vs MTFP21: %.0fx faster\n", mtfp_ns / f32_ns);
+    if (shirley_f32_ns < scalar_ns) {
+        printf("  f32 AVX2 vs scalar: %.1fx faster\n", scalar_ns / shirley_f32_ns);
+    } else {
+        printf("  f32 AVX2 vs scalar: %.1fx slower\n", shirley_f32_ns / scalar_ns);
+    }
 
     tests_passed++;  /* measurement, not pass/fail */
 
-    free(src); free(dst); free(src_f); free(dst_f); free(src_m); free(dst_m);
+    free(src_f); free(dst_f); free(gamma_w); free(dst_i8);
 }
 
 /* ================================================================
@@ -258,7 +323,8 @@ int main(void) {
     printf("Shirley AVX2 Kernel Test Suite\n");
     printf("==============================\n\n");
 
-    test_correctness();
+    test_f32_with_gamma();
+    test_fused_quantize();
     test_dimensions();
     test_performance();
     test_adversarial();
