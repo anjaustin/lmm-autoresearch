@@ -54,10 +54,15 @@
 static void shirley_rmsnorm_f32_inline(
     float * restrict dst, const float * restrict src, int n, float eps
 ) {
+    /* Match baseline cache pattern: memcpy first, then in-place ops.
+     * This keeps the data hot in L1 for the sum-of-squares and scale passes. */
+    memcpy(dst, src, n * sizeof(float));
+
+    /* Sum of squares (in-place read from dst, which is now in cache) */
     __m256 acc = _mm256_setzero_ps();
     int i;
     for (i = 0; i + 8 <= n; i += 8) {
-        __m256 v = _mm256_loadu_ps(src + i);
+        __m256 v = _mm256_loadu_ps(dst + i);
         acc = _mm256_add_ps(acc, _mm256_mul_ps(v, v));
     }
     __m128 lo = _mm256_castps256_ps128(acc);
@@ -67,14 +72,16 @@ static void shirley_rmsnorm_f32_inline(
     sum4 = _mm_hadd_ps(sum4, sum4);
     float sum_sq;
     _mm_store_ss(&sum_sq, sum4);
-    for (; i < n; i++) sum_sq += src[i] * src[i];
+    for (; i < n; i++) sum_sq += dst[i] * dst[i];
+
+    /* Scale in-place */
     float scale = 1.0f / sqrtf(sum_sq / (float)n + eps);
     __m256 vscale = _mm256_set1_ps(scale);
     for (i = 0; i + 8 <= n; i += 8) {
-        __m256 v = _mm256_loadu_ps(src + i);
+        __m256 v = _mm256_loadu_ps(dst + i);
         _mm256_storeu_ps(dst + i, _mm256_mul_ps(v, vscale));
     }
-    for (; i < n; i++) dst[i] = src[i] * scale;
+    for (; i < n; i++) dst[i] *= scale;
 }
 
 /* On-demand bridge: materialize int8 side-buffer from float32 tensor data.
@@ -12201,24 +12208,22 @@ static void ggml_compute_forward_rms_norm_f32(
                 float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
 
 #ifdef SHIRLEY_AVX2_RMSNORM
-                /* Shirley AVX2 RMSNorm — drop-in replacement.
-                 * Same float32 in/out, no gamma (gamma is a separate ggml_mul).
-                 * Uses AVX2 vectorized sum-of-squares and scale. */
-                shirley_rmsnorm_f32_inline(y, x, (int)ne00, eps);
-                /* Log once that Shirley kernel is active */
+                /* Shirley: use baseline's already-SIMD code for float32 RMSNorm.
+                 * The baseline ggml_vec_scale_f32 is already vectorized with
+                 * loop unrolling — our explicit AVX2 doesn't beat it.
+                 *
+                 * Shirley's value is in the int8 path (shirley_rmsnorm_ternary),
+                 * not in replacing an already-fast float32 path.
+                 * Fall through to the baseline code. */
                 {
                     static int shirley_logged = 0;
                     if (!shirley_logged) {
-                        fprintf(stderr, "shirley: AVX2 RMSNorm kernel active\n");
+                        fprintf(stderr, "shirley: pipeline active (baseline float RMSNorm, bridge infrastructure ready)\n");
                         shirley_logged = 1;
                     }
                 }
-
-                /* Bridge note: the int8 path enters via RMSNorm outputting int8
-                 * (shirley_rmsnorm_quantize), not via matmul output int8.
-                 * RMSNorm IS the bridge — it converts float→int8 for the
-                 * next matmul's input. See BRIDGE.md for the architecture. */
-#else
+#endif
+                /* Baseline float32 RMSNorm — already SIMD via ggml_vec_scale_f32 */
                 ggml_float sum = 0.0;
                 for (int64_t i00 = 0; i00 < ne00; i00++) {
                     sum += (ggml_float)(x[i00] * x[i00]);
