@@ -91,6 +91,23 @@ Shirley operates on MTFP21 — a 21-trit balanced ternary floating point represe
 
 See `MTFP21.md` for the full specification.
 
+## Validation: BitNet b1.58-2B-4T (2026-04-01)
+
+The Shirley thesis was tested on a real 2-billion-parameter language model (Microsoft BitNet b1.58-2B-4T) using the autoresearch protocol. 11 experiments across 6 of 8 planned phases.
+
+**Key results:**
+
+- `sign_epi8` produces mathematically identical results to the existing `maddubs_epi16` kernel — the ternary multiply instruction works as the native matmul primitive
+- **4-trit (81-level) activation quantization survives all 28 transformer layers** with no perplexity degradation. The precision floor is between 3 and 4 trits.
+- SiLU activation function output is **naturally ternary-compatible** — quantizing it to 4 trits has literally zero effect on perplexity
+- RMSNorm output is the **precision bottleneck** — needs 7 trits (2187 levels) where everything else survives at 4
+- Residual connections are exact in integer (int16 range sufficient for 28 layers)
+- A non-monotonic anomaly at the 3^3 = 27 quantization boundary suggests ternary-aligned granularities interact favorably with the model's ternary weight structure
+
+The entire linear compute path — matmul, residual ADD, element-wise multiply, and activation functions — can operate at 4-trit precision. The only operation requiring higher precision is RMSNorm (one rsqrt per row). If the integer rsqrt can be computed at 7-trit precision, the full ternary inference pipeline is viable.
+
+Full results: `BITNET_TERNARY_PLAN.md`. Experiment log: `../bitnet/results.tsv`. Journal: `../bitnet/journal/session_001.md`.
+
 ## Research Questions
 
 1. **Shape composition search:** What frozen shapes, composed from six primes, best approximate the functions that neural networks learn? Can an evolutionary search (EntroMorph) discover shapes that match or exceed learned approximations?

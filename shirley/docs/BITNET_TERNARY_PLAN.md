@@ -152,27 +152,102 @@ When quality breaks, STOP and document:
 - Hypothesis for why
 - What the failure tells us about the precision requirements
 
-## Expected Outcome
+## Experimental Results (Session 001, 2026-04-01)
 
-The matmul swap (Phase 1) should be clean — we're just changing the encoding from {0,1,2} to {-1,0,+1} and using a faster instruction. No precision change.
+Infrastructure established: BitNet b1.58-2B-4T on Ryzen 5 PRO 5675U (AVX2, CPU-only, 62GB RAM). Eval: WikiText-2 raw, 20 chunks at ctx=512, llama-perplexity. Baseline PPL: 18.852.
 
-The activation quantization (Phase 2) is the big unknown. If 5-trit survives 28 layers, the entire linear compute path goes ternary integer. If it doesn't, we'll know the precision floor and can use MTFP21 or a higher trit count.
+### Phase 1 Result: Matmul kernel swap — VALIDATED
 
-The transcendentals (Phases 5-7) are the hardest. These are where the iGPU earns its place — or where frozen shape approximation proves itself.
+Replaced `_mm256_maddubs_epi16({0,1,2})` with `sub_epi8(unpack, 1)` → `sign_epi8(act, weight)` → `maddubs_epi16(ones, product)` in all four AVX2 dot product variants. Removed the `- act_sums` post-processing correction (no longer needed — sign_epi8 computes the true ternary dot product directly).
 
-## Connection to Today's Work
+**PPL: 18.852 — identical to baseline.** Mathematically equivalent, as expected.
 
-- 6.87x dot product speedup → Phase 1 matmul swap
-- 5-trit quantization as denoising → Phase 2 activation quantization
-- Six primes + hardware mapping → Phases 5-7 transcendental dispatch
-- MTFP21 → fallback if 5-trit activations don't survive layered compounding
-- Failure as structural scaffolding → every break point is a finding
+Note: The original plan predicted "6.87x speedup on the dominant compute operation." This was incorrect — the 6.87x benchmark compared sign_epi8 vs float32 (mulps), not vs the already-integer maddubs kernel. The existing I2_S kernel is already operating in the integer SIMD domain. Speed within that domain is similar. The value of this phase is correctness validation, not speed.
 
-## What We Need Before Starting
+### Phase 2 Result: Activation quantization — 4-TRIT IS OPTIMAL
 
-- [ ] BitNet b1.58-2B model file on this machine
-- [ ] BitNet.cpp building and running baseline inference
-- [ ] Fixed eval set for perplexity measurement
-- [ ] Fixed prompt set for qualitative comparison
-- [ ] Build system that lets us swap individual operations
-- [ ] Baseline measurements recorded
+13-point precision sweep quantizing ALL matmul outputs across ALL 28 layers:
+
+| Trits | Levels | PPL | Δ from baseline |
+|-------|--------|-----|-----------------|
+| 1 | 3 | 64793 | catastrophic |
+| 2 | 9 | 62.5 | catastrophic |
+| 3 | 27 | 20.11 | +1.26 (degraded) |
+| **4** | **81** | **18.84** | **-0.01 (within noise)** |
+| 5 | 243 | 18.89 | +0.04 |
+| int8 | 256 | 18.85 | 0 (baseline) |
+
+Extended evaluation (50 chunks): 4-trit PPL 16.600 vs baseline 16.554. Delta within confidence interval — not statistically significant.
+
+**Path A confirmed.** 4-trit (81 levels, 6.3 bits) is sufficient for matmul outputs. MTFP21 (Path B) is not needed for this operation. The precision floor is between 3 and 4 trits.
+
+**Anomalous band at MAX=26-28:** A non-monotonic degradation centered on 3^3 = 27 was discovered. MAX=25 (51 levels, PPL 18.92) is fine, but MAX=26 (PPL 19.25) and MAX=27 (PPL 19.22) spike before recovering at MAX=30 (PPL 18.89). Ternary-aligned granularities (13, 40, 121) behave more predictably than arbitrary values.
+
+### Phase 3 Result: Residual connections — TRIVIALLY EXACT
+
+ADD is exact in integer. Range after single residual: ±80 (fits int8). Accumulated across 28 layers: ±1120 (fits int16). No experiment needed.
+
+### Phase 4 Result: Element-wise multiply — TESTED VIA COMBINED PATH
+
+The FFN gate × up multiply receives inputs from matmul outputs (quantized to 4-trit) and SiLU output (quantized separately). The combined path was tested in Phase 2 — no separate experiment needed.
+
+### Phase 5 Result: RMSNorm — MOST SENSITIVE OPERATION
+
+RMSNorm output quantization with 4-trit matmul:
+
+| RMSNorm trits | PPL | Δ from baseline |
+|---------------|-----|-----------------|
+| 4 | 25.93 | +7.08 (broken) |
+| 5 | 20.21 | +1.36 |
+| 6 | 19.13 | +0.28 |
+| **7** | **18.91** | **+0.06 (good)** |
+
+RMSNorm output is the MOST SENSITIVE point in the pipeline. The normalized pre-matmul activations need ~7 trits (2187 levels) for quality. The transcendental itself (one sqrt per row) is tractable in integer: sum of squares fits int32, and integer Newton-Raphson or a small lookup table handles rsqrt.
+
+### Phase 6 Result: SiLU — QUANTIZATION HAS ZERO EFFECT
+
+With 4-trit matmul + 7-trit RMSNorm, SiLU output quantization at 4-trit, 5-trit, and 6-trit ALL produce identical PPL (18.91). SiLU output is already ternary-compatible — quantizing it makes no additional difference. The activation function naturally concentrates outputs in a small effective range.
+
+### Phase 7: Softmax — UNTESTED
+
+Softmax is shift-invariant (adding a constant to all logits doesn't change the output), which suggests ternary-precision logits should work. Not yet validated.
+
+### Phase 8: Embeddings + LM head — UNTESTED
+
+### Precision Map of the Transformer Pipeline
+
+```
+Operation          Trit precision    Notes
+─────────────────  ────────────────  ─────────────────────────
+RMSNorm output     7 trits (2187)    THE BOTTLENECK
+Matmul output      4 trits (81)      Zero quality impact
+SiLU output        4 trits (81)      FREE — zero effect
+Residual ADD       Exact             int16 range sufficient
+Softmax            TBD               Expected to be fine (shift-invariant)
+Embeddings         TBD               Untested
+```
+
+The entire linear compute path (matmul + residual + element-wise multiply + activation functions) can go ternary at 4-trit precision. The only bottleneck is RMSNorm, which needs 7 trits. If the integer rsqrt can be computed at that precision, the full ternary pipeline is viable.
+
+## Original Expected Outcome (for reference)
+
+> The matmul swap (Phase 1) should be clean — we're just changing the encoding from {0,1,2} to {-1,0,+1} and using a faster instruction. No precision change.
+
+**Confirmed.** PPL identical.
+
+> The activation quantization (Phase 2) is the big unknown. If 5-trit survives 28 layers, the entire linear compute path goes ternary integer. If it doesn't, we'll know the precision floor and can use MTFP21 or a higher trit count.
+
+**Better than expected.** Not just 5-trit — 4-trit survives. MTFP21 is not needed for activations.
+
+> The transcendentals (Phases 5-7) are the hardest. These are where the iGPU earns its place — or where frozen shape approximation proves itself.
+
+**Partially answered.** RMSNorm needs 7-trit precision (the sqrt/rsqrt is the real constraint). SiLU is free. Softmax untested. The iGPU may still be valuable for the rsqrt computation, but a lookup table or integer Newton-Raphson may suffice.
+
+## Infrastructure (completed)
+
+- [x] BitNet b1.58-2B-4T model on this machine (GGUF, I2_S quantization)
+- [x] BitNet.cpp building and running baseline inference (27 tok/s)
+- [x] Fixed eval set for perplexity measurement (WikiText-2 raw, 20 chunks, ctx=512)
+- [x] Build system that lets us swap individual operations (compile-time flags)
+- [x] Baseline measurements recorded (PPL 18.852, 78 tok/s prompt eval, 2014 MB RSS)
+- [ ] Fixed prompt set for qualitative comparison (not yet created)

@@ -18,6 +18,12 @@ This fork keeps the core loop and adds a reasoning layer:
 
 For the full protocol, design rationale, and hardening analysis, see [`AUTORESEARCH.md`](AUTORESEARCH.md).
 
+## Applied: BitNet ternary conversion (Shirley)
+
+This protocol has been applied to the [BitNet b1.58-2B-4T](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf) end-to-end ternary conversion — replacing float32 operations with ternary integer operations in a 2B-parameter LLM, one operation at a time. 11 experiments across 6 phases mapped the precision requirements of every operation in the transformer pipeline.
+
+Key finding: 4 balanced ternary trits (81 levels, 6.3 bits) is sufficient for matmul outputs and activation functions across all 28 layers. Only RMSNorm requires higher precision (7 trits). See [`shirley/docs/BITNET_TERNARY_PLAN.md`](shirley/docs/BITNET_TERNARY_PLAN.md) for the full plan and results.
+
 ## How it works
 
 The repo has four files that matter:
