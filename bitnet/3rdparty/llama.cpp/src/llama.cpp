@@ -15359,7 +15359,7 @@ struct llm_build_context {
             cb(cur, "ffn_sub_norm", il);
 
             cur = llm_build_lora_mm(lctx, ctx0, model.layers[il].ffn_down, cur);
-            cur->shirley_bridge = 1; // Shirley: bridge down output to int8
+            /* Shirley: int8 output produced directly by Phase 1 bridge in ggml.c */
             if (model.layers[il].ffn_down_scale) {
                 cur = ggml_mul(ctx0, cur, model.layers[il].ffn_down_scale);
             }
@@ -15469,7 +15469,7 @@ struct llm_build_context {
                 cb(cur, "attn_sub_norm", il);
 
                 cur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wo, cur);
-                cur->shirley_bridge = 1; // Shirley: bridge wo output to int8
+                /* Shirley: int8 output produced directly by Phase 1 bridge in ggml.c */
                 if (model.layers[il].wo_scale) {
                     cur = ggml_mul(ctx0, cur, model.layers[il].wo_scale);
                 }
@@ -15509,7 +15509,7 @@ struct llm_build_context {
             cb(cur, "ffn_sub_norm", il);
 
             cur = llm_build_lora_mm(lctx, ctx0, model.layers[il].ffn_down, cur);
-            cur->shirley_bridge = 1; // Shirley: bridge down output to int8
+            /* Shirley: int8 output produced directly by Phase 1 bridge in ggml.c */
             if (model.layers[il].ffn_down_scale) {
                 cur = ggml_mul(ctx0, cur, model.layers[il].ffn_down_scale);
             }

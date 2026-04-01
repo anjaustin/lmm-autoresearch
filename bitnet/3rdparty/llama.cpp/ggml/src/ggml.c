@@ -131,6 +131,45 @@ static void shirley_bridge_materialize(struct ggml_tensor * tensor) {
 }
 #endif
 
+/* Shirley Phase 1: rescale raw int32 dot products to int8 directly.
+ * Avoids the float32 intermediate entirely.
+ * raw_f32: array of raw integer dot product results (stored as float, lossless for |val| < 2^24)
+ * dst_i8: output int8 buffer
+ * n: number of elements
+ * combined_scale: weight_scale / act_scale (precomputed per-layer)
+ * out_range: clamp range (80 for 5-trit)
+ * Returns dequantization scale: real_value = int8 * returned_scale */
+static float shirley_rescale_raw_to_i8(
+    int8_t * restrict dst_i8,
+    const float * restrict raw_f32,
+    int n,
+    float combined_scale,
+    int out_range
+) {
+    float max_abs = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float v = raw_f32[i] * combined_scale;
+        float a = v > 0 ? v : -v;
+        if (a > max_abs) max_abs = a;
+    }
+
+    if (max_abs < 1e-10f) {
+        for (int i = 0; i < n; i++) dst_i8[i] = 0;
+        return 0.0f;
+    }
+
+    float qscale = (float)out_range / max_abs;
+    for (int i = 0; i < n; i++) {
+        float v = raw_f32[i] * combined_scale * qscale;
+        int32_t r = (int32_t)(v + (v >= 0 ? 0.5f : -0.5f));
+        if (r > out_range) r = out_range;
+        if (r < -out_range) r = -out_range;
+        dst_i8[i] = (int8_t)r;
+    }
+
+    return max_abs / (float)out_range;
+}
+
 #if defined(GGML_BITNET_ARM_TL1) || defined(GGML_BITNET_X86_TL2)
 #include "ggml-bitnet.h"
 #endif
@@ -12649,48 +12688,58 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 // }
 
                 if (src0->type == GGML_TYPE_I2_S && iir0 + blck_0 - 1 < ir0_end) {
-                    // 16 rows per vector dot product, so we can process 16 rows at a time blck == 16
-                    // this is a bit of a hack, we should probably have a better way to handle this
                     vec_dot(ne00, &tmp[0], 1,
                         src0_row + iir0 * nb01 / 4, nb01,
                         src1_col_de, 0, 16);
 
-                    // post compute activation scaling
+                    /* Shirley Phase 1: direct int8 output for all I2_S matmuls */
+                    /* Shirley Phase 1: direct int8 output when bridge is active.
+                     * tmp[] holds raw int32 dot products (losslessly in float).
+                     * combined_scale = (*scale) / act_scales[i1] = weight_scale / act_scale. */
+                    /* Shirley Phase 1: all I2_S matmuls produce int8 */
+                    {
+                        float combined_scale = (*scale) / act_scales[i1];
+                        if (!dst->shirley_i8) {
+                            int64_t total = ggml_nelements(dst);
+                            dst->shirley_i8 = malloc(total * sizeof(int8_t));
+                            static int logged = 0;
+                            if (!logged && dst->shirley_i8) {
+                                fprintf(stderr, "shirley: Phase 1 active — int32→int8 direct rescale\n");
+                                logged = 1;
+                            }
+                        }
+                        if (dst->shirley_i8) {
+                            int8_t * i8_col = (int8_t *)dst->shirley_i8
+                                + (i1 * (nb1/sizeof(float)) + i2 * (nb2/sizeof(float)) + i3 * (nb3/sizeof(float)));
+                            dst->shirley_scale = shirley_rescale_raw_to_i8(
+                                i8_col + iir0, tmp, 16, combined_scale, 80);
+                        }
+                    }
+
+                    /* Float path: always written for ggml graph consumers */
                     for (int row = 0; row < 16; row++) {
                         tmp[row] = (tmp[row]) / (act_scales[i1]) * (*scale);
                     }
-
-#ifdef SHIRLEY_5TRIT_QUANT
-                    // 5-trit activation quantization: simulate precision reduction
-                    // 5 balanced ternary trits = 243 states = integers in [-121, 121]
-                    {
-                        float max_abs = 0.0f;
-                        for (int row = 0; row < 16; row++) {
-                            float a = fabsf(tmp[row]);
-                            if (a > max_abs) max_abs = a;
-                        }
-                        if (max_abs > 1e-10f) {
-                            // SHIRLEY_TRIT_LEVELS: (3^N - 1) / 2
-// 5 trits: 121, 4 trits: 40, 3 trits: 13, 6 trits: 364
-#ifndef SHIRLEY_TRIT_MAX
-#define SHIRLEY_TRIT_MAX 121.0f
-#endif
-                            float s5t = SHIRLEY_TRIT_MAX / max_abs;
-                            for (int row = 0; row < 16; row++) {
-                                float v = tmp[row] * s5t;
-                                if (v > SHIRLEY_TRIT_MAX) v = SHIRLEY_TRIT_MAX;
-                                if (v < -SHIRLEY_TRIT_MAX) v = -SHIRLEY_TRIT_MAX;
-                                tmp[row] = roundf(v) / s5t;
-                            }
-                        }
-                    }
-#endif
                 }
                 else
                 {
                     for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
                         if (src0->type == GGML_TYPE_I2_S) {
                             vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_row + ir0 * nb01 / 4, 0, src1_col_de, 0, 1);
+                            /* Shirley Phase 1: int8 direct for 1-row path */
+                            {
+                                float combined_scale = (*scale) / act_scales[i1];
+                                if (!dst->shirley_i8) {
+                                    int64_t total = ggml_nelements(dst);
+                                    dst->shirley_i8 = malloc(total * sizeof(int8_t));
+                                }
+                                if (dst->shirley_i8) {
+                                    int8_t * i8_col = (int8_t *)dst->shirley_i8
+                                        + (i1 * (nb1/sizeof(float)) + i2 * (nb2/sizeof(float)) + i3 * (nb3/sizeof(float)));
+                                    dst->shirley_scale = shirley_rescale_raw_to_i8(
+                                        i8_col + ir0, &tmp[ir0 - iir0], 1, combined_scale, 80);
+                                }
+                            }
                             tmp[ir0 - iir0] = (tmp[ir0 - iir0]) / (act_scales[i1]) * (*scale);
                         } else {
                             vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
@@ -13444,6 +13493,21 @@ UseGgmlGemm2:;
                     (const char *) src1_wdata, ne11 - ne11 % 4, src0_end - src0_start);
                 for (int col = 0; col < ne11 - ne11 % 4; col++) {
                     int64_t n_rows = src0_end - src0_start;
+
+                    /* Shirley Phase 1: int8 direct for gemm path */
+                    {
+                        float combined_scale = (*scale) / act_scales[col];
+                        if (!dst->shirley_i8) {
+                            int64_t total = ggml_nelements(dst);
+                            dst->shirley_i8 = malloc(total * sizeof(int8_t));
+                        }
+                        if (dst->shirley_i8) {
+                            int8_t * i8_dst = (int8_t *)dst->shirley_i8 + (col * nb1/sizeof(float)) + src0_start;
+                            dst->shirley_scale = shirley_rescale_raw_to_i8(
+                                i8_dst, tmp + col * n_rows, (int)n_rows, combined_scale, 80);
+                        }
+                    }
+
                     for (int row = 0; row < n_rows; row++) {
                         tmp[col * n_rows + row] = (tmp[col * n_rows + row]) / (act_scales[col]) * (*scale);
                     }
@@ -13455,8 +13519,6 @@ UseGgmlGemm2:;
                             if (a > max_abs) max_abs = a;
                         }
                         if (max_abs > 1e-10f) {
-                            // SHIRLEY_TRIT_LEVELS: (3^N - 1) / 2
-// 5 trits: 121, 4 trits: 40, 3 trits: 13, 6 trits: 364
 #ifndef SHIRLEY_TRIT_MAX
 #define SHIRLEY_TRIT_MAX 121.0f
 #endif
@@ -13482,6 +13544,7 @@ UseGgmlGemm2:;
         }
         for (int iter = gemm ? ne11 - ne11 % 4 : 0; iter < ne11; iter++) {
             if (src0->type == GGML_TYPE_I2_S) {
+                /* Shirley Phase 1: all I2_S matmuls produce int8 via gemv */
                 float tmp[src0_end - src0_start];
                 const float * scale      = (float * )((uint8_t*) (src0->data) + (ne00 * ne01 / 4));
                 const float * act_scales = (const float*) ((const char *) src1_wdata + (ne11 * ne10));
@@ -13492,6 +13555,21 @@ UseGgmlGemm2:;
                     1, src0_end - src0_start);
                 {
                     int64_t n_rows = src0_end - src0_start;
+
+                    /* Shirley Phase 1: int8 direct for gemv path */
+                    {
+                        float combined_scale = (*scale) / act_scales[iter];
+                        if (!dst->shirley_i8) {
+                            int64_t total = ggml_nelements(dst);
+                            dst->shirley_i8 = malloc(total * sizeof(int8_t));
+                        }
+                        if (dst->shirley_i8) {
+                            int8_t * i8_dst = (int8_t *)dst->shirley_i8 + (iter * nb1/sizeof(float)) + src0_start;
+                            dst->shirley_scale = shirley_rescale_raw_to_i8(
+                                i8_dst, tmp, (int)n_rows, combined_scale, 80);
+                        }
+                    }
+
                     for (int row = 0; row < n_rows; row++) {
                         tmp[row] = (tmp[row]) / (act_scales[iter]) * (*scale);
                     }
