@@ -11,7 +11,7 @@
 #include <time.h>
 #include <string.h>
 #include "shirley_kernels.h"
-#include "shirley_mtfp21.h"
+/* shirley_mtfp21.h included via shirley_kernels.h */
 
 static int tests_passed = 0;
 static int tests_failed = 0;
@@ -328,6 +328,105 @@ int main(void) {
     test_dimensions();
     test_performance();
     test_adversarial();
+
+    /* Test 5: End-to-end ternary kernel */
+    {
+        printf("=== Test 5: shirley_rmsnorm_ternary (zero float) ===\n");
+
+        int n = 2560;
+        int out_range = 80;
+        int8_t *src = (int8_t *)malloc(n);
+        int8_t *dst_ternary = (int8_t *)malloc(n);
+        int8_t *dst_legacy = (int8_t *)malloc(n);
+
+        srand(42);
+        for (int i = 0; i < n; i++) {
+            src[i] = (int8_t)((rand() % 161) - 80);
+        }
+
+        /* Ternary kernel (zero float) */
+        shirley_rmsnorm_ternary(dst_ternary, src, n, out_range);
+
+        /* Float64 reference */
+        double sum_sq = 0.0;
+        for (int i = 0; i < n; i++) sum_sq += (double)src[i] * (double)src[i];
+        double scale = 1.0 / sqrt(sum_sq / n + 1e-5);
+
+        int exact = 0, off1 = 0, worse = 0;
+        for (int i = 0; i < n; i++) {
+            int ref_q = (int)round((double)src[i] * scale);
+            if (ref_q > out_range) ref_q = out_range;
+            if (ref_q < -out_range) ref_q = -out_range;
+            int diff = abs((int)dst_ternary[i] - ref_q);
+            if (diff == 0) exact++;
+            else if (diff == 1) off1++;
+            else worse++;
+        }
+
+        printf("  vs float64 ref: Exact=%d (%.1f%%), Off-by-1=%d, Worse=%d\n",
+               exact, 100.0*exact/n, off1, worse);
+
+        int pass = ((float)(exact + off1) / n >= 0.99f) && ((float)exact / n >= 0.90f);
+        if (pass) { printf("  PASS\n"); tests_passed++; }
+        else { printf("  FAIL\n"); tests_failed++; }
+
+        /* Performance comparison: ternary vs float hybrid vs MTFP21 */
+        printf("\n  --- Performance ---\n");
+        struct timespec t0, t1;
+        int iters = 10000;
+
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int it = 0; it < iters; it++) {
+            shirley_rmsnorm_ternary(dst_ternary, src, n, out_range);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double ternary_ns = elapsed_us(t0, t1) * 1000.0 / iters;
+
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int it = 0; it < iters; it++) {
+            ternary_rmsnorm_avx2(dst_legacy, src, n, 1e-5f, out_range);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double legacy_ns = elapsed_us(t0, t1) * 1000.0 / iters;
+
+        /* MTFP21 for comparison */
+        mtfp21_t *src_m = (mtfp21_t *)malloc(n * sizeof(mtfp21_t));
+        mtfp21_t *dst_m = (mtfp21_t *)malloc(n * sizeof(mtfp21_t));
+        mtfp21_t eps_m = mtfp21_from_float(1e-5f);
+        for (int i = 0; i < n; i++) src_m[i] = mtfp21_from_int8(src[i]);
+
+        int mtfp_iters = 100;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int it = 0; it < mtfp_iters; it++) {
+            mtfp21_rmsnorm_pure(dst_m, src_m, n, eps_m);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double mtfp_ns = elapsed_us(t0, t1) * 1000.0 / mtfp_iters;
+
+        printf("  %-40s %8.0f ns\n", "shirley_rmsnorm_ternary (ZERO FLOAT):", ternary_ns);
+        printf("  %-40s %8.0f ns\n", "ternary_rmsnorm_avx2 (float rsqrt):", legacy_ns);
+        printf("  %-40s %8.0f ns\n", "mtfp21_rmsnorm_pure (scalar MTFP21):", mtfp_ns);
+        printf("\n");
+        printf("  ternary vs float-hybrid: %.1fx %s\n",
+               legacy_ns > ternary_ns ? legacy_ns / ternary_ns : ternary_ns / legacy_ns,
+               legacy_ns > ternary_ns ? "faster" : "slower");
+        printf("  ternary vs MTFP21:       %.0fx faster\n", mtfp_ns / ternary_ns);
+        tests_passed++;
+
+        /* Verify output matches float hybrid (both should agree with reference) */
+        ternary_rmsnorm_avx2(dst_legacy, src, n, 1e-5f, out_range);
+        int match = 0;
+        for (int i = 0; i < n; i++) {
+            if (dst_ternary[i] == dst_legacy[i]) match++;
+        }
+        printf("  ternary vs float-hybrid agreement: %d/%d (%.1f%%)\n",
+               match, n, 100.0*match/n);
+        if ((float)match / n >= 0.95f) { printf("  PASS\n"); tests_passed++; }
+        else { printf("  FAIL\n"); tests_failed++; }
+
+        free(src); free(dst_ternary); free(dst_legacy);
+        free(src_m); free(dst_m);
+    }
 
     printf("\n==============================\n");
     printf("Results: %d passed, %d failed\n", tests_passed, tests_failed);

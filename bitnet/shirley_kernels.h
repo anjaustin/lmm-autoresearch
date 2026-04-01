@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <immintrin.h>
+#include "shirley_mtfp21.h"
 
 /* ================================================================
  *  Shirley RMSNorm — hybrid AVX2/FPU kernel for ternary pipeline
@@ -150,7 +151,161 @@ static float shirley_rmsnorm_quantize(
 }
 
 /* ================================================================
- *  Legacy: int8→int8 RMSNorm (no gamma, for backward compat)
+ *  Variant 3: END-TO-END TERNARY — int8→int8, zero float ops
+ *
+ *  Uses MTFP21 integer rsqrt (LUT+NR) for the scalar computation.
+ *  Uses AVX2 integer multiply+shift for the per-element scaling.
+ *  The only non-integer operation: none. This is the thesis.
+ *
+ *  Architecture:
+ *    Phase 1+2: AVX2 int8→int16→int32 sum of squares
+ *    Phase 3:   MTFP21 integer rsqrt (LUT + 2 Newton-Raphson)
+ *    Phase 4:   Convert MTFP21 scale to Q15 fixed-point
+ *    Phase 5:   AVX2 int16 × int16 → int16, shift, pack → int8
+ * ================================================================ */
+
+static void shirley_rmsnorm_ternary(
+    int8_t       * restrict dst,
+    const int8_t * restrict src,
+    int           n,
+    int           out_range   /* output clamp, e.g. 80 for 5-trit */
+) {
+    /* ---- Phase 1+2: Sum of squares in AVX2 integer ---- */
+    __m256i acc32 = _mm256_setzero_si256();
+    const __m256i ones_16 = _mm256_set1_epi16(1);
+    int i;
+
+    for (i = 0; i + 32 <= n; i += 32) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(src + i));
+        __m256i lo16 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(v));
+        __m256i hi16 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(v, 1));
+        __m256i sq_lo = _mm256_mullo_epi16(lo16, lo16);
+        __m256i sq_hi = _mm256_mullo_epi16(hi16, hi16);
+        acc32 = _mm256_add_epi32(acc32, _mm256_madd_epi16(sq_lo, ones_16));
+        acc32 = _mm256_add_epi32(acc32, _mm256_madd_epi16(sq_hi, ones_16));
+    }
+
+    __m128i lo128 = _mm256_castsi256_si128(acc32);
+    __m128i hi128 = _mm256_extracti128_si256(acc32, 1);
+    __m128i sum128 = _mm_add_epi32(lo128, hi128);
+    sum128 = _mm_hadd_epi32(sum128, sum128);
+    sum128 = _mm_hadd_epi32(sum128, sum128);
+    int32_t sum_sq = _mm_cvtsi128_si32(sum128);
+
+    for (; i < n; i++) sum_sq += (int32_t)src[i] * (int32_t)src[i];
+
+    /* ---- Phase 3: MTFP21 integer rsqrt ----
+     *
+     * Compute rsqrt(sum_sq / n + eps) entirely in integer.
+     * eps = 1e-5 ≈ negligible for integer sum_sq values.
+     * For int8 input: sum_sq ranges [0, n*127^2]. For n=2560: up to 41M.
+     * mean = sum_sq / n. We use mtfp21_div_scalar.
+     */
+    mtfp21_t m_sum = {sum_sq, 0};
+    mtfp21_t m_mean = mtfp21_div_scalar(m_sum, n);
+
+    /* Add epsilon: 1e-5 in MTFP21 = {15032, -20} (precomputed without float)
+     * 15032 * 3^(-20) = 15032 / 3486784401 ≈ 4.31e-6. Close enough.
+     * Actually let's compute a better one: 1e-5 ≈ 10 * 3^(-16) = 10 / 43046721 ≈ 2.32e-7.
+     * That's too small. Let's use: 14349 * 3^(-19) = 14349 / 1162261467 ≈ 1.235e-5.
+     * Close enough to 1e-5 for epsilon purposes. */
+    static const mtfp21_t M_EPS = {14349, -19};
+    mtfp21_t m_mean_eps = mtfp21_add(m_mean, M_EPS);
+
+    mtfp21_t m_scale = mtfp21_rsqrt(m_mean_eps);
+
+    /* ---- Phase 4: Convert MTFP21 scale to Q15 fixed-point ----
+     *
+     * We need: dst[i] = clamp(round(src[i] * scale), ±out_range)
+     * where scale = m_scale.mantissa * 3^(m_scale.exponent)
+     *
+     * Strategy: represent scale as (numerator / denominator) where both
+     * are integers, then compute (src[i] * numerator + denominator/2) / denominator.
+     *
+     * For AVX2: use Q15 format. scale_q15 = round(scale * 32768).
+     * Then: result = (int16(src[i]) * scale_q15) >> 15.
+     *
+     * Computing scale_q15 from MTFP21 without float:
+     *   scale = mantissa * 3^exponent
+     *   scale_q15 = mantissa * 3^exponent * 32768
+     *             = mantissa * 32768 * 3^exponent  (if exponent >= 0)
+     *             = (mantissa * 32768) / 3^(-exponent)  (if exponent < 0)
+     */
+    int64_t scale_q15;
+    int exp = m_scale.exponent;
+    if (exp >= 0) {
+        scale_q15 = (int64_t)m_scale.mantissa * 32768;
+        if (exp < 32) scale_q15 *= POW3[exp];
+        /* For very large scales, this could overflow. In practice,
+         * rsqrt of a mean is O(1), so the scale is moderate. */
+    } else {
+        int neg_exp = -exp;
+        if (neg_exp < 32) {
+            /* (mantissa * 32768 + POW3[neg_exp]/2) / POW3[neg_exp] — rounded */
+            int64_t num = (int64_t)m_scale.mantissa * 32768;
+            int64_t den = POW3[neg_exp];
+            scale_q15 = (num + den / 2) / den;
+        } else {
+            scale_q15 = 0;
+        }
+    }
+
+    /* Clamp scale_q15 to int16 range for SIMD multiply */
+    if (scale_q15 > 32767) scale_q15 = 32767;
+    if (scale_q15 < -32767) scale_q15 = -32767;
+    int16_t sq15 = (int16_t)scale_q15;
+
+    /* ---- Phase 5: Scale via AVX2 integer multiply + shift ----
+     *
+     * For each element: dst = clamp((int16(src) * sq15 + 16384) >> 15, ±out_range)
+     * The +16384 is rounding (half of 32768).
+     *
+     * _mm256_mullo_epi16: 16-bit × 16-bit → low 16 bits (NOT what we want)
+     * _mm256_mulhi_epi16: 16-bit × 16-bit → high 16 bits (= result >> 16)
+     *
+     * For Q15: we want result >> 15. Use mulhi (gives >>16) then adjust:
+     * Actually, use: _mm256_mulhrs_epi16 which computes
+     *   round((a * b) >> 14) / 2 = round((a * b) >> 15)
+     * This is EXACTLY the Q15 multiply-round-shift we need!
+     */
+    __m256i vscale_q15 = _mm256_set1_epi16(sq15);
+    __m256i vclamp_pos = _mm256_set1_epi8((int8_t)(out_range > 127 ? 127 : out_range));
+    __m256i vclamp_neg = _mm256_set1_epi8((int8_t)(out_range > 127 ? -128 : -out_range));
+
+    for (i = 0; i + 32 <= n; i += 32) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(src + i));
+
+        /* Widen int8 → int16 */
+        __m256i lo16 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(v));
+        __m256i hi16 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(v, 1));
+
+        /* Q15 multiply-round-shift: round((a * b) >> 15) */
+        __m256i r_lo = _mm256_mulhrs_epi16(lo16, vscale_q15);
+        __m256i r_hi = _mm256_mulhrs_epi16(hi16, vscale_q15);
+
+        /* Pack int16 → int8 with saturation */
+        __m256i r8 = _mm256_packs_epi16(r_lo, r_hi);
+        /* Fix lane ordering from packs */
+        r8 = _mm256_permute4x64_epi64(r8, 0xD8);
+
+        /* Clamp to ±out_range */
+        r8 = _mm256_max_epi8(r8, vclamp_neg);
+        r8 = _mm256_min_epi8(r8, vclamp_pos);
+
+        _mm256_storeu_si256((__m256i *)(dst + i), r8);
+    }
+
+    /* Tail */
+    for (; i < n; i++) {
+        int32_t r = ((int32_t)src[i] * (int32_t)sq15 + 16384) >> 15;
+        if (r > out_range) r = out_range;
+        if (r < -out_range) r = -out_range;
+        dst[i] = (int8_t)r;
+    }
+}
+
+/* ================================================================
+ *  Legacy: int8→int8 RMSNorm (float rsqrt, for backward compat)
  * ================================================================ */
 
 static void ternary_rmsnorm_avx2(
