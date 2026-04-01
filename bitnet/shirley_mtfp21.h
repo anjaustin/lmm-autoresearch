@@ -142,6 +142,140 @@ static inline mtfp21_t mtfp21_abs(mtfp21_t a) {
     return a;
 }
 
+/* Forward declarations */
+static inline mtfp21_t mtfp21_mul(mtfp21_t a, mtfp21_t b);
+static inline mtfp21_t mtfp21_add(mtfp21_t a, mtfp21_t b);
+
+/* ================================================================
+ *  int8 ↔ MTFP21 conversion
+ * ================================================================ */
+
+/* Convert int8 activation to MTFP21. The int8 value IS the mantissa. */
+static inline mtfp21_t mtfp21_from_int8(int8_t val) {
+    mtfp21_t r;
+    r.mantissa = (int32_t)val;
+    r.exponent = 0;
+    return r;
+}
+
+/* Convert MTFP21 to int8, clamped to [-max_range, +max_range].
+ * max_range: 40 for 4-trit, 121 for 5-trit, 1093 for 7-trit, etc. */
+static inline int8_t mtfp21_to_int8(mtfp21_t a, int max_range) {
+    if (a.mantissa == 0) return 0;
+
+    int64_t val;
+    int exp = a.exponent;
+
+    if (exp == 0) {
+        val = (int64_t)a.mantissa;
+    } else if (exp > 0) {
+        /* Multiply mantissa by 3^exp */
+        if (exp < 32) {
+            val = (int64_t)a.mantissa * POW3[exp];
+        } else {
+            /* Overflow: clamp */
+            val = (a.mantissa > 0) ? max_range : -max_range;
+            goto clamp;
+        }
+    } else {
+        /* Divide mantissa by 3^(-exp), with rounding */
+        int neg_exp = -exp;
+        if (neg_exp < 32) {
+            int64_t divisor = POW3[neg_exp];
+            int64_t half = divisor / 2;
+            if (a.mantissa >= 0) {
+                val = ((int64_t)a.mantissa + half) / divisor;
+            } else {
+                val = -(((int64_t)(-a.mantissa) + half) / divisor);
+            }
+        } else {
+            val = 0; /* Underflow to zero */
+        }
+    }
+
+clamp:
+    if (val > max_range)  val = max_range;
+    if (val < -max_range) val = -max_range;
+    return (int8_t)val;
+}
+
+/* ================================================================
+ *  Integer division
+ * ================================================================ */
+
+/* Compute 1/n as MTFP21 without using float.
+ * Finds exponent E such that POW3[-E] / n maximizes mantissa precision. */
+static inline mtfp21_t mtfp21_recip_int(int32_t n) {
+    mtfp21_t r;
+    if (n == 0) { r.mantissa = 0; r.exponent = MTFP21_EXP_MAX; return r; }
+    if (n == 1) { r.mantissa = 1; r.exponent = 0; return r; }
+    if (n == -1) { r.mantissa = -1; r.exponent = 0; return r; }
+
+    int sign = (n > 0) ? 1 : -1;
+    int64_t absn = (int64_t)(n > 0 ? n : -n);
+
+    /* Search for the largest exponent magnitude where POW3[e] / absn fits in mantissa */
+    int best_e = 0;
+    int64_t best_mant = 0;
+
+    for (int e = 0; e < 31; e++) {
+        int64_t mant = POW3[e] / absn;
+        if (mant > MTFP21_MANT_MAX) break;
+        /* Round: check if remainder >= half divisor */
+        int64_t rem = POW3[e] % absn;
+        if (rem * 2 >= absn) mant++;
+        if (mant <= MTFP21_MANT_MAX && mant > best_mant) {
+            best_mant = mant;
+            best_e = e;
+        }
+    }
+
+    r.mantissa = (int32_t)(sign * best_mant);
+    r.exponent = (int8_t)(-best_e);
+    return r;
+}
+
+/* Divide MTFP21 value by integer scalar. No float operations. */
+static inline mtfp21_t mtfp21_div_scalar(mtfp21_t a, int32_t n) {
+    if (a.mantissa == 0) return a;
+    mtfp21_t recip = mtfp21_recip_int(n);
+    return mtfp21_mul(a, recip);
+}
+
+/* General MTFP21 / MTFP21 division via reciprocal multiply. */
+static inline mtfp21_t mtfp21_div(mtfp21_t a, mtfp21_t b) {
+    if (a.mantissa == 0) { mtfp21_t z = {0, 0}; return z; }
+    if (b.mantissa == 0) { mtfp21_t z = {0, 0}; return z; } /* div by zero → 0 */
+
+    /* Compute reciprocal of b: find M,E such that M * 3^E ≈ 1 / (b.mantissa * 3^b.exponent)
+     * = 1/b.mantissa * 3^(-b.exponent)
+     * We want M = MTFP21_MANT_MAX-scale / |b.mantissa| with appropriate exponent. */
+    int sign_b = (b.mantissa > 0) ? 1 : -1;
+    int64_t abs_bm = (int64_t)(b.mantissa > 0 ? b.mantissa : -b.mantissa);
+
+    /* Find e such that POW3[e] / abs_bm is close to MTFP21_MANT_MAX */
+    int best_e = 0;
+    int64_t best_mant = 0;
+    for (int e = 0; e < 31; e++) {
+        int64_t mant = POW3[e] / abs_bm;
+        if (mant > MTFP21_MANT_MAX) break;
+        int64_t rem = POW3[e] % abs_bm;
+        if (rem * 2 >= abs_bm) mant++;
+        if (mant <= MTFP21_MANT_MAX && mant > best_mant) {
+            best_mant = mant;
+            best_e = e;
+        }
+    }
+
+    mtfp21_t recip;
+    recip.mantissa = (int32_t)(sign_b * best_mant);
+    recip.exponent = (int8_t)(-best_e - b.exponent);
+
+    return mtfp21_mul(a, recip);
+}
+
+/* ================================================================ */
+
 /* Ternary right-shift mantissa by n positions (divide by 3^n, round) */
 static inline int32_t trit_rshift(int32_t mant, int n) {
     for (int i = 0; i < n; i++) {
@@ -279,27 +413,122 @@ static inline mtfp21_t mtfp21_mul(mtfp21_t a, mtfp21_t b) {
  *  (adapted for integer: y = y * (3 - x*y*y) >> 1)
  * ================================================================ */
 
+/* 256-entry rsqrt LUT for integer-only Newton-Raphson seed.
+ * Indexed by normalized mantissa in [MANT_MAX/3, MANT_MAX].
+ * Max LUT error: 6.39e-08 (already within float32 precision).
+ * Generated by build-time script — runtime never touches float. */
+static const struct { int32_t mant; int8_t exp; } RSQRT_LUT[256] = {
+    {11693018,-22},{11647784,-22},{11603071,-22},{11558868,-22},{11515167,-22},
+    {11471958,-22},{11429232,-22},{11386980,-22},{11345192,-22},{11303862,-22},
+    {11262980,-22},{11222538,-22},{11182529,-22},{11142945,-22},{11103778,-22},
+    {11065021,-22},{11026667,-22},{10988710,-22},{10951141,-22},{10913956,-22},
+    {10877146,-22},{10840707,-22},{10804631,-22},{10768913,-22},{10733547,-22},
+    {10698527,-22},{10663848,-22},{10629504,-22},{10595489,-22},{10561799,-22},
+    {10528429,-22},{10495372,-22},{10462625,-22},{10430183,-22},{10398041,-22},
+    {10366193,-22},{10334637,-22},{10303367,-22},{10272380,-22},{10241670,-22},
+    {10211234,-22},{10181068,-22},{10151168,-22},{10121529,-22},{10092149,-22},
+    {10063023,-22},{10034147,-22},{10005519,-22},{ 9977135,-22},{ 9948990,-22},
+    { 9921083,-22},{ 9893409,-22},{ 9865965,-22},{ 9838749,-22},{ 9811756,-22},
+    { 9784985,-22},{ 9758431,-22},{ 9732093,-22},{ 9705966,-22},{ 9680049,-22},
+    { 9654338,-22},{ 9628831,-22},{ 9603526,-22},{ 9578418,-22},{ 9553507,-22},
+    { 9528789,-22},{ 9504262,-22},{ 9479923,-22},{ 9455770,-22},{ 9431801,-22},
+    { 9408013,-22},{ 9384405,-22},{ 9360973,-22},{ 9337716,-22},{ 9314631,-22},
+    { 9291717,-22},{ 9268971,-22},{ 9246391,-22},{ 9223976,-22},{ 9201723,-22},
+    { 9179630,-22},{ 9157695,-22},{ 9135917,-22},{ 9114293,-22},{ 9092823,-22},
+    { 9071503,-22},{ 9050333,-22},{ 9029310,-22},{ 9008433,-22},{ 8987700,-22},
+    { 8967109,-22},{ 8946660,-22},{ 8926350,-22},{ 8906177,-22},{ 8886141,-22},
+    { 8866239,-22},{ 8846470,-22},{ 8826833,-22},{ 8807326,-22},{ 8787948,-22},
+    { 8768697,-22},{ 8749573,-22},{ 8730572,-22},{ 8711695,-22},{ 8692940,-22},
+    { 8674306,-22},{ 8655791,-22},{ 8637394,-22},{ 8619114,-22},{ 8600949,-22},
+    { 8582899,-22},{ 8564962,-22},{ 8547137,-22},{ 8529422,-22},{ 8511818,-22},
+    { 8494322,-22},{ 8476933,-22},{ 8459651,-22},{ 8442474,-22},{ 8425401,-22},
+    { 8408431,-22},{ 8391564,-22},{ 8374798,-22},{ 8358131,-22},{ 8341564,-22},
+    { 8325095,-22},{ 8308723,-22},{ 8292448,-22},{ 8276267,-22},{ 8260181,-22},
+    { 8244188,-22},{ 8228288,-22},{ 8212480,-22},{ 8196762,-22},{ 8181134,-22},
+    { 8165596,-22},{ 8150145,-22},{ 8134782,-22},{ 8119505,-22},{ 8104315,-22},
+    { 8089209,-22},{ 8074187,-22},{ 8059249,-22},{ 8044393,-22},{ 8029619,-22},
+    { 8014926,-22},{ 8000314,-22},{ 7985781,-22},{ 7971327,-22},{ 7956951,-22},
+    { 7942653,-22},{ 7928431,-22},{ 7914286,-22},{ 7900216,-22},{ 7886221,-22},
+    { 7872300,-22},{ 7858453,-22},{ 7844678,-22},{ 7830976,-22},{ 7817345,-22},
+    { 7803785,-22},{ 7790295,-22},{ 7776875,-22},{ 7763524,-22},{ 7750242,-22},
+    { 7737027,-22},{ 7723880,-22},{ 7710800,-22},{ 7697786,-22},{ 7684838,-22},
+    { 7671954,-22},{ 7659136,-22},{ 7646381,-22},{ 7633690,-22},{ 7621062,-22},
+    { 7608496,-22},{ 7595993,-22},{ 7583550,-22},{ 7571169,-22},{ 7558848,-22},
+    { 7546587,-22},{ 7534386,-22},{ 7522243,-22},{ 7510159,-22},{ 7498134,-22},
+    { 7486165,-22},{ 7474254,-22},{ 7462400,-22},{ 7450601,-22},{ 7438859,-22},
+    { 7427172,-22},{ 7415539,-22},{ 7403962,-22},{ 7392438,-22},{ 7380968,-22},
+    { 7369551,-22},{ 7358187,-22},{ 7346876,-22},{ 7335616,-22},{ 7324408,-22},
+    { 7313251,-22},{ 7302145,-22},{ 7291090,-22},{ 7280084,-22},{ 7269129,-22},
+    { 7258222,-22},{ 7247365,-22},{ 7236556,-22},{ 7225795,-22},{ 7215082,-22},
+    { 7204417,-22},{ 7193799,-22},{ 7183228,-22},{21518108,-23},{21486672,-23},
+    {21455373,-23},{21424210,-23},{21393183,-23},{21362291,-23},{21331531,-23},
+    {21300904,-23},{21270409,-23},{21240045,-23},{21209810,-23},{21179703,-23},
+    {21149725,-23},{21119874,-23},{21090148,-23},{21060548,-23},{21031072,-23},
+    {21001720,-23},{20972490,-23},{20943381,-23},{20914394,-23},{20885527,-23},
+    {20856778,-23},{20828149,-23},{20799637,-23},{20771241,-23},{20742962,-23},
+    {20714797,-23},{20686748,-23},{20658811,-23},{20630988,-23},{20603277,-23},
+    {20575677,-23},{20548188,-23},{20520808,-23},{20493538,-23},{20466376,-23},
+    {20439322,-23},{20412375,-23},{20385535,-23},{20358799,-23},{20332169,-23},
+    {20305643,-23}
+};
+
+/* Integer-only rsqrt: LUT seed + 2 Newton-Raphson iterations.
+ * No float operations. */
 static inline mtfp21_t mtfp21_rsqrt(mtfp21_t x) {
     if (x.mantissa <= 0) {
         mtfp21_t r = {0, 0};
         return r;
     }
 
-    /* Initial estimate via float (will replace with LUT later) */
-    float fx = mtfp21_to_float(x);
-    float est = 1.0f / sqrtf(fx);
-    mtfp21_t y = mtfp21_from_float(est);
+    /* Normalize mantissa to [MANT_MAX/3, MANT_MAX] */
+    int32_t mant = x.mantissa;
+    int exp = x.exponent;
+    while (mant > 0 && mant * 3 <= MTFP21_MANT_MAX && exp > -MTFP21_EXP_MAX) {
+        mant *= 3;
+        exp--;
+    }
 
-    /* Newton-Raphson: y_new = y * (3 - x * y * y) / 2 */
-    mtfp21_t three = mtfp21_from_float(3.0f);
-    mtfp21_t half  = mtfp21_from_float(0.5f);
+    /* Handle odd exponent: multiply mantissa by 3, adjust exponent to even */
+    int odd_exp = exp & 1;
+    if (odd_exp) {
+        /* For odd exp, we need 1/sqrt(mant * 3^exp) = 1/sqrt(mant*3) * 3^(-(exp-1)/2) */
+        if ((int64_t)mant * 3 <= MTFP21_MANT_MAX) {
+            mant *= 3;
+            exp--;
+        } else {
+            /* mant*3 overflows — shift right instead */
+            mant = (mant + 1) / 3; /* round */
+            exp++;
+        }
+    }
 
-    for (int i = 0; i < 3; i++) {
-        mtfp21_t y2  = mtfp21_mul(y, y);      /* y^2 */
-        mtfp21_t xy2 = mtfp21_mul(x, y2);     /* x * y^2 */
-        mtfp21_t diff = mtfp21_add(three, mtfp21_neg(xy2)); /* 3 - x*y^2 */
-        mtfp21_t step = mtfp21_mul(diff, half); /* (3 - x*y^2) / 2 */
-        y = mtfp21_mul(y, step);               /* y * (3 - x*y^2) / 2 */
+    /* LUT index from normalized mantissa */
+    int32_t mant_min = MTFP21_MANT_MAX / 3; /* 7174453 */
+    int32_t mant_range = MTFP21_MANT_MAX - mant_min; /* 14348907 */
+    int idx = (int)((int64_t)(mant - mant_min) * 256 / mant_range);
+    if (idx < 0) idx = 0;
+    if (idx > 255) idx = 255;
+
+    /* Seed from LUT */
+    mtfp21_t y;
+    y.mantissa = RSQRT_LUT[idx].mant;
+    y.exponent = RSQRT_LUT[idx].exp + (-exp / 2);
+    /* LUT was computed for mantissa-only (exponent=0).
+     * For input M * 3^E: rsqrt = rsqrt(M) * 3^(-E/2)
+     * LUT gives rsqrt(M), so add -E/2 to the exponent. */
+
+    /* Newton-Raphson: y = y * (3 - x*y*y) / 2
+     * Constants: three = {1, 1} (exact: 1*3^1 = 3)
+     *            half  = {21523360, -16} (≈0.5, error 1.16e-8) */
+    static const mtfp21_t NR_THREE = {1, 1};
+    static const mtfp21_t NR_HALF  = {21523360, -16};
+
+    for (int i = 0; i < 2; i++) {
+        mtfp21_t y2   = mtfp21_mul(y, y);
+        mtfp21_t xy2  = mtfp21_mul(x, y2);
+        mtfp21_t diff = mtfp21_add(NR_THREE, mtfp21_neg(xy2));
+        mtfp21_t step = mtfp21_mul(diff, NR_HALF);
+        y = mtfp21_mul(y, step);
     }
 
     return y;
