@@ -930,6 +930,227 @@ static void test_performance(void) {
 }
 
 /* ================================================================
+ *  Test: MTFP21 exp()
+ * ================================================================ */
+
+static void test_exp(void) {
+    printf("--- test_exp ---\n");
+
+    /* Basic values */
+    struct { float input; float expected; const char *name; } cases[] = {
+        { 0.0f,    1.0f,         "exp(0)" },
+        { 1.0f,    2.71828182f,  "exp(1)" },
+        {-1.0f,    0.36787944f,  "exp(-1)" },
+        { 2.0f,    7.38905609f,  "exp(2)" },
+        {-2.0f,    0.13533528f,  "exp(-2)" },
+        { 0.5f,    1.64872127f,  "exp(0.5)" },
+        {-0.5f,    0.60653066f,  "exp(-0.5)" },
+        { 5.0f,  148.41315910f,  "exp(5)" },
+        {-5.0f,    0.00673795f,  "exp(-5)" },
+        {10.0f, 22026.46579f,    "exp(10)" },
+        {-10.0f,   0.0000453999f,"exp(-10)" },
+        { 0.001f,  1.001000500f, "exp(0.001)" },
+        {-0.001f,  0.999000500f, "exp(-0.001)" },
+    };
+    int ncases = sizeof(cases) / sizeof(cases[0]);
+
+    int pass = 0;
+    float max_rel_err = 0.0f;
+
+    for (int i = 0; i < ncases; i++) {
+        mtfp21_t x = mtfp21_from_float(cases[i].input);
+        mtfp21_t result = mtfp21_exp(x);
+        float got = mtfp21_to_float(result);
+        float expected = cases[i].expected;
+
+        float rel_err;
+        if (fabsf(expected) < 1e-20f) {
+            rel_err = fabsf(got);
+        } else {
+            rel_err = fabsf((got - expected) / expected);
+        }
+
+        if (rel_err > max_rel_err) max_rel_err = rel_err;
+
+        /* Allow 0.1% relative error — LUT + linear interp */
+        if (rel_err < 1e-3f) {
+            pass++;
+        } else {
+            printf("  FAIL: %s: expected %.8e, got %.8e (rel_err=%.2e)\n",
+                   cases[i].name, expected, got, rel_err);
+            tests_failed++;
+        }
+    }
+
+    printf("  Basic cases: %d/%d passed (max rel error: %.2e)\n", pass, ncases, max_rel_err);
+    if (pass == ncases) tests_passed++;
+
+    /* Softmax-range test: exp(x) for x in [-30, 0] (typical attention scores) */
+    printf("  Softmax range test (x in [-30, 0]):\n");
+    int softmax_pass = 0;
+    int softmax_total = 100;
+    float softmax_max_err = 0.0f;
+
+    for (int i = 0; i < softmax_total; i++) {
+        float xf = -30.0f * (float)i / (float)(softmax_total - 1);
+        double expected_d = exp((double)xf);
+        mtfp21_t xm = mtfp21_from_float(xf);
+        mtfp21_t rm = mtfp21_exp(xm);
+        float got = mtfp21_to_float(rm);
+
+        float rel_err;
+        if (expected_d < 1e-20) {
+            /* For very small values, check absolute error */
+            rel_err = fabsf(got - (float)expected_d);
+            if (rel_err < 1e-10f) { softmax_pass++; continue; }
+        } else {
+            rel_err = fabsf((got - (float)expected_d) / (float)expected_d);
+        }
+        if (rel_err > softmax_max_err) softmax_max_err = rel_err;
+
+        if (rel_err < 1e-3f) {
+            softmax_pass++;
+        } else {
+            if (softmax_total - softmax_pass <= 5) { /* only print first few failures */
+                printf("    FAIL: exp(%.4f): expected %.8e, got %.8e (rel_err=%.2e)\n",
+                       xf, (float)expected_d, got, rel_err);
+            }
+        }
+    }
+    printf("  Softmax range: %d/%d passed (max rel error: %.2e)\n",
+           softmax_pass, softmax_total, softmax_max_err);
+    if (softmax_pass == softmax_total) tests_passed++;
+    else tests_failed++;
+
+    /* Large positive values */
+    printf("  Large value test:\n");
+    float large_vals[] = {20.0f, 40.0f, 60.0f, 70.0f};
+    int large_pass = 0;
+    for (int i = 0; i < 4; i++) {
+        double expected_d = exp((double)large_vals[i]);
+        mtfp21_t xm = mtfp21_from_float(large_vals[i]);
+        mtfp21_t rm = mtfp21_exp(xm);
+        float got = mtfp21_to_float(rm);
+        float rel_err = fabsf((got - (float)expected_d) / (float)expected_d);
+        printf("    exp(%.0f) = %.4e (expected %.4e, rel_err=%.2e)\n",
+               large_vals[i], got, (float)expected_d, rel_err);
+        if (rel_err < 1e-2f) large_pass++;  /* relaxed for large values */
+    }
+    if (large_pass == 4) tests_passed++;
+    else tests_failed++;
+
+    printf("\n");
+}
+
+/* ================================================================
+ *  Test: MTFP21 softmax
+ * ================================================================ */
+
+static void test_softmax(void) {
+    printf("--- test_softmax ---\n");
+
+    /* Small vector: known softmax output */
+    float inputs[] = {1.0f, 2.0f, 3.0f, 4.0f};
+    int n = 4;
+
+    /* Reference softmax in float64 */
+    double ref_probs[4];
+    double max_val = -1e30;
+    for (int i = 0; i < n; i++) {
+        if (inputs[i] > max_val) max_val = inputs[i];
+    }
+    double sum_exp = 0.0;
+    for (int i = 0; i < n; i++) {
+        ref_probs[i] = exp((double)(inputs[i] - max_val));
+        sum_exp += ref_probs[i];
+    }
+    for (int i = 0; i < n; i++) {
+        ref_probs[i] /= sum_exp;
+    }
+
+    /* MTFP21 softmax */
+    mtfp21_t src[4];
+    for (int i = 0; i < n; i++) {
+        src[i] = mtfp21_from_float(inputs[i]);
+    }
+    int8_t dst[4];
+    mtfp21_t work[4];
+    mtfp21_softmax(dst, src, n, 80, work);
+
+    printf("  Reference vs MTFP21 softmax (out_range=80):\n");
+    int pass = 1;
+    for (int i = 0; i < n; i++) {
+        float ref_quantized = (float)(ref_probs[i] * 80.0);
+        printf("    [%d] ref_prob=%.4f ref_q=%.1f got_q=%d\n",
+               i, (float)ref_probs[i], ref_quantized, (int)dst[i]);
+        /* Check within ±2 of expected quantized value */
+        if (abs((int)dst[i] - (int)(ref_quantized + 0.5f)) > 2) {
+            pass = 0;
+        }
+    }
+    if (pass) { printf("  PASSED\n"); tests_passed++; }
+    else { printf("  FAILED\n"); tests_failed++; }
+
+    /* Verify probabilities sum to ~out_range (conservation) */
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += dst[i];
+    printf("  Sum of quantized probs: %d (expected ~80)\n", sum);
+    if (abs(sum - 80) <= 3) { printf("  Conservation: PASSED\n"); tests_passed++; }
+    else { printf("  Conservation: FAILED\n"); tests_failed++; }
+
+    /* Softmax with typical attention score spread */
+    printf("  Attention-scale test (n=16, scores in [-10, 0]):\n");
+    int n2 = 16;
+    mtfp21_t src2[16];
+    int8_t dst2[16];
+    mtfp21_t work2[16];
+    for (int i = 0; i < n2; i++) {
+        float v = -10.0f * (float)i / (float)(n2 - 1);
+        src2[i] = mtfp21_from_float(v);
+    }
+    mtfp21_softmax(dst2, src2, n2, 80, work2);
+
+    /* First element should dominate (score = 0, others negative) */
+    printf("    dst[0]=%d (should dominate), dst[15]=%d (should be ~0)\n",
+           (int)dst2[0], (int)dst2[15]);
+    /* With scores [-10,0] over 16 elements, prob[0]=0.487, q80=38.9 */
+    if (dst2[0] > 35 && dst2[15] <= 1) {
+        printf("  Attention distribution: PASSED\n");
+        tests_passed++;
+    } else {
+        printf("  Attention distribution: FAILED\n");
+        tests_failed++;
+    }
+
+    printf("\n");
+}
+
+/* ================================================================
+ *  Test: MTFP21 comparison
+ * ================================================================ */
+
+static void test_cmp(void) {
+    printf("--- test_cmp ---\n");
+    int pass = 0;
+
+    mtfp21_t a = mtfp21_from_float(3.14f);
+    mtfp21_t b = mtfp21_from_float(2.71f);
+    mtfp21_t c = mtfp21_from_float(3.14f);
+    mtfp21_t d = mtfp21_from_float(-1.0f);
+    mtfp21_t z = {0, 0};
+
+    if (mtfp21_cmp(a, b) == 1) pass++; else { printf("  FAIL: 3.14 > 2.71\n"); tests_failed++; }
+    if (mtfp21_cmp(b, a) == -1) pass++; else { printf("  FAIL: 2.71 < 3.14\n"); tests_failed++; }
+    if (mtfp21_cmp(a, c) == 0) pass++; else { printf("  FAIL: 3.14 == 3.14\n"); tests_failed++; }
+    if (mtfp21_cmp(d, z) == -1) pass++; else { printf("  FAIL: -1 < 0\n"); tests_failed++; }
+    if (mtfp21_cmp(z, d) == 1) pass++; else { printf("  FAIL: 0 > -1\n"); tests_failed++; }
+    if (mtfp21_cmp(z, z) == 0) pass++; else { printf("  FAIL: 0 == 0\n"); tests_failed++; }
+
+    printf("  %d/6 passed\n\n", pass);
+    if (pass == 6) tests_passed++;
+}
+
+/* ================================================================
  *  Main
  * ================================================================ */
 
@@ -949,6 +1170,9 @@ int main(void) {
     test_accumulation_statistical();
     test_rmsnorm_pure();
     test_chained_pipeline();
+    test_exp();
+    test_softmax();
+    test_cmp();
     test_performance();
 
     printf("======================\n");

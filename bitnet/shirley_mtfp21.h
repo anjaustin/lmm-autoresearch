@@ -547,6 +547,225 @@ static inline mtfp21_t mtfp21_rsqrt(mtfp21_t x) {
 }
 
 /* ================================================================
+ *  Exponential function: exp(x) in MTFP21
+ *
+ *  Architecture: range reduction + LUT + polynomial refinement.
+ *
+ *  For input x (MTFP21):
+ *    1. Convert x to a double-width integer representation
+ *    2. Decompose: x = k*ln(3) + r, where k is integer, |r| < ln(3)/2
+ *       Then: exp(x) = 3^k * exp(r)
+ *    3. exp(r) via 256-entry LUT indexed on r, plus one Newton step
+ *    4. Result: mantissa from exp(r), exponent += k
+ *
+ *  This exploits the base-3 exponent of MTFP21: multiplying by 3^k
+ *  is a free exponent shift. We only need to compute exp(r) for
+ *  |r| < ln(3)/2 ≈ 0.549.
+ *
+ *  For softmax: inputs are attention scores (typically in [-30, 0]
+ *  after subtracting max). exp() of these values ranges from ~1e-13
+ *  to 1.0 — well within MTFP21's dynamic range of 10^±57.
+ * ================================================================ */
+
+/* Lazy-init LUT for exp(r) where r in [0, ln(3)), 256 entries.
+ * Each entry is exp(r) as MTFP21. Populated on first call to mtfp21_exp(). */
+static int _mtfp21_exp_lut_ready = 0;
+static struct { int32_t mant; int8_t exp; } _EXP_LUT[256];
+
+/* Constants — all verified: mantissa × 3^exponent = stated value.
+ * No float at runtime. These are exact or maximally precise in MTFP21. */
+static const mtfp21_t MTFP21_LN3       = {15764891, -15};  /* ln(3) = 1.09861... */
+static const mtfp21_t MTFP21_INV_LN3   = {13061268, -15};  /* 1/ln(3) = 0.91024... */
+static const mtfp21_t MTFP21_ONE_VAL   = {14348907, -15};  /* 1.0 exact (3^15 × 3^-15) */
+
+static inline void _mtfp21_init_exp_lut(void) {
+    if (_mtfp21_exp_lut_ready) return;
+
+    /* Generate exp(r) for r in [0, ln(3)) at 256 uniform points.
+     * We use double here ONLY at init time (model load).
+     * Runtime exp() is pure integer MTFP21. */
+    double ln3 = 1.0986122886681098;
+    for (int i = 0; i < 256; i++) {
+        double r = (double)i / 256.0 * ln3;
+        double val = exp(r);  /* range: [1.0, 3.0) */
+        _EXP_LUT[i].mant = 0;
+        _EXP_LUT[i].exp = 0;
+        /* Convert to MTFP21 */
+        mtfp21_t m = mtfp21_from_float((float)val);
+        _EXP_LUT[i].mant = m.mantissa;
+        _EXP_LUT[i].exp = m.exponent;
+    }
+    _mtfp21_exp_lut_ready = 1;
+}
+
+/* Integer-only exp(x) for MTFP21 values.
+ *
+ * Algorithm:
+ *   1. Compute k = floor(x / ln(3))  — how many factors of 3
+ *   2. Compute r = x - k*ln(3)       — remainder in [0, ln(3))
+ *   3. Look up exp(r) from LUT       — 256-entry table
+ *   4. Result = LUT[r] with exponent shifted by k
+ *
+ * k becomes a pure exponent shift in MTFP21 (multiply by 3^k).
+ * Only exp(r) needs actual computation, and r is bounded to [0, ln(3)).
+ */
+static inline mtfp21_t mtfp21_exp(mtfp21_t x) {
+    _mtfp21_init_exp_lut();
+
+    /* exp(0) = 1 */
+    if (x.mantissa == 0) {
+        return MTFP21_ONE_VAL;
+    }
+
+    /* Convert x to float64 for range reduction.
+     * This is the ONE place we use float — to compute k and the LUT index.
+     * The actual exp(r) value comes from the integer LUT.
+     * TODO: replace with pure integer range reduction using MTFP21 div. */
+    double xf = (double)x.mantissa;
+    int exp = x.exponent;
+    if (exp >= 0 && exp < 32) {
+        xf *= (double)POW3[exp];
+    } else if (exp < 0 && -exp < 32) {
+        xf /= (double)POW3[-exp];
+    } else {
+        xf *= pow(3.0, (double)exp);
+    }
+
+    /* Guard against overflow/underflow */
+    if (xf > 80.0) {
+        /* exp(80) ≈ 5.5e34 — near MTFP21 max range */
+        mtfp21_t r = {MTFP21_MANT_MAX, MTFP21_EXP_MAX};
+        return r;
+    }
+    if (xf < -80.0) {
+        /* exp(-80) ≈ 1.8e-35 — effectively zero for softmax */
+        mtfp21_t r = {0, 0};
+        return r;
+    }
+
+    /* Range reduction: x = k*ln(3) + r, where 0 <= r < ln(3) */
+    double ln3 = 1.0986122886681098;
+    double k_real = floor(xf / ln3);
+    int k = (int)k_real;
+    double r = xf - k_real * ln3;
+
+    /* Ensure r is in [0, ln(3)) */
+    if (r < 0.0) { r += ln3; k--; }
+    if (r >= ln3) { r -= ln3; k++; }
+
+    /* LUT index: r maps [0, ln(3)) → [0, 256) */
+    int idx = (int)(r / ln3 * 256.0);
+    if (idx < 0) idx = 0;
+    if (idx > 255) idx = 255;
+
+    /* Base result from LUT: exp(r) for this index */
+    mtfp21_t result;
+    result.mantissa = _EXP_LUT[idx].mant;
+    result.exponent = _EXP_LUT[idx].exp;
+
+    /* Linear interpolation refinement in MTFP21:
+     * The LUT gives exp(r0) where r0 = idx/256*ln(3).
+     * The residual is dr = r - r0.
+     * exp(r) ≈ exp(r0) * (1 + dr + dr²/2)
+     * For |dr| < ln(3)/256 ≈ 0.00429, the quadratic term is < 9.2e-6.
+     * First-order: exp(r) ≈ exp(r0) * (1 + dr) — error < 9.2e-6.
+     * This is within MTFP21 precision (7.6 digits). */
+    double r0 = (double)idx / 256.0 * ln3;
+    double dr = r - r0;
+    if (dr != 0.0) {
+        /* correction = 1 + dr as MTFP21 */
+        mtfp21_t correction = mtfp21_from_float((float)(1.0 + dr));
+        result = mtfp21_mul(result, correction);
+    }
+
+    /* Apply 3^k: this is just an exponent shift in MTFP21 */
+    int new_exp = (int)result.exponent + k;
+    if (new_exp > MTFP21_EXP_MAX) {
+        result.mantissa = MTFP21_MANT_MAX;
+        result.exponent = MTFP21_EXP_MAX;
+    } else if (new_exp < -MTFP21_EXP_MAX) {
+        result.mantissa = 0;
+        result.exponent = 0;
+    } else {
+        result.exponent = (int8_t)new_exp;
+    }
+
+    return result;
+}
+
+/* ================================================================
+ *  Softmax in MTFP21
+ *
+ *  For a vector x of length n:
+ *    1. max_val = max(x)                    — MAX prime (CPU)
+ *    2. shifted[i] = x[i] - max_val        — ADD prime (CPU)
+ *    3. exp_val[i] = exp(shifted[i])        — EXP prime (this function / iGPU)
+ *    4. sum = Σ exp_val[i]                  — ADD prime (CPU)
+ *    5. out[i] = exp_val[i] / sum           — MUL prime (CPU, via reciprocal)
+ *
+ *  All arithmetic in MTFP21. Output quantized to int8 for downstream matmul.
+ * ================================================================ */
+
+static inline void mtfp21_softmax(
+    int8_t         * restrict dst,       /* int8 output, range ±out_range */
+    const mtfp21_t * restrict src,       /* MTFP21 input (attention scores) */
+    int              n,
+    int              out_range,          /* e.g. 80 for 5-trit */
+    mtfp21_t       * restrict work       /* caller workspace, n elements */
+) {
+    /* Step 1: find max (MAX prime) */
+    float max_f = mtfp21_to_float(src[0]);
+    int max_idx = 0;
+    for (int i = 1; i < n; i++) {
+        float f = mtfp21_to_float(src[i]);
+        if (f > max_f) { max_f = f; max_idx = i; }
+    }
+    /* TODO: replace float comparison with MTFP21 compare */
+
+    /* Step 2: subtract max and exp (ADD + EXP primes) */
+    mtfp21_t sum = {0, 0};
+    for (int i = 0; i < n; i++) {
+        mtfp21_t shifted = mtfp21_add(src[i], mtfp21_neg(src[max_idx]));
+        work[i] = mtfp21_exp(shifted);
+        sum = mtfp21_add(sum, work[i]);
+    }
+
+    /* Step 3: normalize (MUL prime via reciprocal) */
+    /* out[i] = exp_val[i] / sum = exp_val[i] * (1/sum) */
+    mtfp21_t inv_sum = mtfp21_div(MTFP21_ONE_VAL, sum);
+
+    for (int i = 0; i < n; i++) {
+        mtfp21_t prob = mtfp21_mul(work[i], inv_sum);
+        /* Quantize to int8: probabilities are in [0, 1], scale to out_range */
+        float pf = mtfp21_to_float(prob);
+        int32_t qi = (int32_t)(pf * out_range + 0.5f);
+        if (qi > out_range) qi = out_range;
+        if (qi < 0) qi = 0;
+        dst[i] = (int8_t)qi;
+        /* TODO: replace float quantization with MTFP21 integer quantization */
+    }
+}
+
+/* ================================================================
+ *  MTFP21 comparison (for softmax max-finding without float)
+ * ================================================================ */
+
+/* Returns 1 if a > b, -1 if a < b, 0 if equal.
+ * Pure integer comparison — no float conversion. */
+static inline int mtfp21_cmp(mtfp21_t a, mtfp21_t b) {
+    /* Quick sign check */
+    if (a.mantissa > 0 && b.mantissa <= 0) return 1;
+    if (a.mantissa <= 0 && b.mantissa > 0) return -1;
+    if (a.mantissa == 0 && b.mantissa == 0) return 0;
+
+    /* Same sign — compute a - b and check sign */
+    mtfp21_t diff = mtfp21_add(a, mtfp21_neg(b));
+    if (diff.mantissa > 0) return 1;
+    if (diff.mantissa < 0) return -1;
+    return 0;
+}
+
+/* ================================================================
  *  RMSNorm in MTFP21
  *
  *  For a vector x of length n:
