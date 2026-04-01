@@ -357,6 +357,175 @@ static void shirley_rmsnorm_ternary(
 }
 
 /* ================================================================
+ *  Ternary primitives — the six primes at Layer 1
+ *
+ *  Each operation is one or two AVX2 instructions on int8/int16.
+ *  These are the building blocks between ternary matmuls.
+ * ================================================================ */
+
+/* ---- ReLU: MAX(x, 0) ---- */
+static void shirley_relu_i8(
+    int8_t       * restrict dst,
+    const int8_t * restrict src,
+    int           n
+) {
+    const __m256i zero = _mm256_setzero_si256();
+    int i;
+    for (i = 0; i + 32 <= n; i += 32) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(src + i));
+        _mm256_storeu_si256((__m256i *)(dst + i), _mm256_max_epi8(v, zero));
+    }
+    for (; i < n; i++) dst[i] = src[i] > 0 ? src[i] : 0;
+}
+
+/* ---- Square: x² (int8 → int16) ----
+ * Output is int16 because max(80²) = 6400 > 127.
+ * After ReLU, input is in [0, 80], so output is in [0, 6400]. */
+static void shirley_square_i8_to_i16(
+    int16_t      * restrict dst,
+    const int8_t * restrict src,
+    int           n
+) {
+    int i;
+    for (i = 0; i + 32 <= n; i += 32) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(src + i));
+        __m256i lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(v));
+        __m256i hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(v, 1));
+        _mm256_storeu_si256((__m256i *)(dst + i),      _mm256_mullo_epi16(lo, lo));
+        _mm256_storeu_si256((__m256i *)(dst + i + 16), _mm256_mullo_epi16(hi, hi));
+    }
+    for (; i < n; i++) dst[i] = (int16_t)src[i] * (int16_t)src[i];
+}
+
+/* ---- Residual ADD: a + b (int8 + int8 → int16) ----
+ * Widens to int16 to avoid overflow. Two int8 values in ±80 sum to ±160,
+ * which exceeds int8 range but fits int16 comfortably.
+ * The caller is responsible for requantizing to int8 if needed. */
+static void shirley_residual_add_i16(
+    int16_t      * restrict dst,
+    const int8_t * restrict a,
+    const int8_t * restrict b,
+    int           n
+) {
+    int i;
+    for (i = 0; i + 32 <= n; i += 32) {
+        __m256i va = _mm256_loadu_si256((const __m256i *)(a + i));
+        __m256i vb = _mm256_loadu_si256((const __m256i *)(b + i));
+        /* Widen both to int16 and add */
+        __m256i a_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va));
+        __m256i a_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(va, 1));
+        __m256i b_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb));
+        __m256i b_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vb, 1));
+        _mm256_storeu_si256((__m256i *)(dst + i),      _mm256_add_epi16(a_lo, b_lo));
+        _mm256_storeu_si256((__m256i *)(dst + i + 16), _mm256_add_epi16(a_hi, b_hi));
+    }
+    for (; i < n; i++) dst[i] = (int16_t)a[i] + (int16_t)b[i];
+}
+
+/* ---- Requantize: int16 → int8 with scale ----
+ * Finds max abs value, computes scale, quantizes to ±out_range.
+ * Returns the quantization scale (for MTFP21 bookkeeping).
+ * This is the standard transition when int16 needs to feed an int8 consumer. */
+static float shirley_requantize_i16_to_i8(
+    int8_t        * restrict dst,
+    const int16_t * restrict src,
+    int           n,
+    int           out_range
+) {
+    /* Find max abs */
+    int16_t max_abs = 0;
+    int i;
+
+    /* AVX2: find max of absolute values */
+    __m256i vmax = _mm256_setzero_si256();
+    for (i = 0; i + 16 <= n; i += 16) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(src + i));
+        __m256i va = _mm256_abs_epi16(v);
+        vmax = _mm256_max_epi16(vmax, va);
+    }
+    /* Horizontal max of 16 int16 values */
+    __m128i vmax128 = _mm_max_epi16(_mm256_castsi256_si128(vmax),
+                                     _mm256_extracti128_si256(vmax, 1));
+    vmax128 = _mm_max_epi16(vmax128, _mm_srli_si128(vmax128, 8));
+    vmax128 = _mm_max_epi16(vmax128, _mm_srli_si128(vmax128, 4));
+    vmax128 = _mm_max_epi16(vmax128, _mm_srli_si128(vmax128, 2));
+    max_abs = (int16_t)_mm_extract_epi16(vmax128, 0);
+
+    /* Tail */
+    for (; i < n; i++) {
+        int16_t a = src[i] > 0 ? src[i] : -src[i];
+        if (a > max_abs) max_abs = a;
+    }
+
+    if (max_abs == 0) {
+        for (i = 0; i < n; i++) dst[i] = 0;
+        return 0.0f;
+    }
+
+    /* Quantize: dst = round(src * out_range / max_abs) clamped to ±out_range
+     * Use integer: dst = (src * out_range + max_abs/2) / max_abs */
+    int32_t half = max_abs / 2;
+    for (i = 0; i < n; i++) {
+        int32_t v = (int32_t)src[i] * out_range;
+        int32_t r;
+        if (v >= 0) r = (v + half) / max_abs;
+        else        r = -((-v + half) / max_abs);
+        if (r > out_range) r = out_range;
+        if (r < -out_range) r = -out_range;
+        dst[i] = (int8_t)r;
+    }
+
+    /* Return scale factor: real_value = int8_value * (max_abs / out_range) */
+    return (float)max_abs / (float)out_range;
+}
+
+/* ---- Element-wise MUL: a × b (int16 × int8 → int8 with rescale) ----
+ * For the FFN gate² × up operation.
+ * a is int16 (gate², range [0, 6400] after relu+square)
+ * b is int8 (up, range [-80, +80])
+ * Product range: [-512000, +512000] (needs int32)
+ * Output: requantized to int8 at ±out_range
+ * Returns quantization scale for MTFP21 bookkeeping. */
+static float shirley_mul_i16_i8_to_i8(
+    int8_t        * restrict dst,
+    const int16_t * restrict a,
+    const int8_t  * restrict b,
+    int           n,
+    int           out_range
+) {
+    /* First pass: compute products and find max abs (in int32) */
+    int32_t max_abs = 0;
+    int i;
+    /* Use temp buffer for products */
+    int32_t *products = (int32_t *)__builtin_alloca(n * sizeof(int32_t));
+
+    for (i = 0; i < n; i++) {
+        products[i] = (int32_t)a[i] * (int32_t)b[i];
+        int32_t abs_v = products[i] > 0 ? products[i] : -products[i];
+        if (abs_v > max_abs) max_abs = abs_v;
+    }
+
+    if (max_abs == 0) {
+        for (i = 0; i < n; i++) dst[i] = 0;
+        return 0.0f;
+    }
+
+    /* Second pass: quantize to int8 */
+    int64_t half = (int64_t)max_abs / 2;
+    for (i = 0; i < n; i++) {
+        int64_t v = (int64_t)products[i] * out_range;
+        int32_t r;
+        if (v >= 0) r = (int32_t)((v + half) / max_abs);
+        else        r = (int32_t)(-((-v + half) / max_abs));
+        if (r > out_range) r = out_range;
+        if (r < -out_range) r = -out_range;
+        dst[i] = (int8_t)r;
+    }
+
+    return (float)max_abs / (float)out_range;
+}
+
+/* ================================================================
  *  Legacy: int8→int8 RMSNorm (float rsqrt, for backward compat)
  * ================================================================ */
 

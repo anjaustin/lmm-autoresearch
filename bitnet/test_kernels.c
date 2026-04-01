@@ -512,6 +512,203 @@ int main(void) {
         free(src); free(dst_ternary); free(dst_legacy);
     }
 
+    /* Test 6: Ternary primitives */
+    printf("=== Test 6: Ternary primitives ===\n");
+    {
+        int n = 2560;
+        int8_t *a = (int8_t *)malloc(n);
+        int8_t *b = (int8_t *)malloc(n);
+        int8_t *dst_i8 = (int8_t *)malloc(n);
+        int16_t *dst_i16 = (int16_t *)malloc(n * sizeof(int16_t));
+        int16_t *sq = (int16_t *)malloc(n * sizeof(int16_t));
+
+        srand(42);
+        for (int i = 0; i < n; i++) {
+            a[i] = (int8_t)((rand() % 161) - 80);
+            b[i] = (int8_t)((rand() % 161) - 80);
+        }
+
+        /* ---- ReLU ---- */
+        shirley_relu_i8(dst_i8, a, n);
+        int relu_ok = 1;
+        for (int i = 0; i < n; i++) {
+            int8_t expected = a[i] > 0 ? a[i] : 0;
+            if (dst_i8[i] != expected) { relu_ok = 0; break; }
+        }
+        printf("  ReLU:          %s (%d elements)\n", relu_ok ? "PASS" : "FAIL", n);
+        if (relu_ok) tests_passed++; else tests_failed++;
+
+        /* ---- Square ---- */
+        int8_t *relu_out = (int8_t *)malloc(n);
+        shirley_relu_i8(relu_out, a, n);  /* ReLU first (square follows ReLU in FFN) */
+        shirley_square_i8_to_i16(dst_i16, relu_out, n);
+        int sq_ok = 1;
+        for (int i = 0; i < n; i++) {
+            int16_t expected = (int16_t)relu_out[i] * (int16_t)relu_out[i];
+            if (dst_i16[i] != expected) { sq_ok = 0; break; }
+        }
+        printf("  Square:        %s (max=%d)\n", sq_ok ? "PASS" : "FAIL",
+               dst_i16[0]); /* just show one value */
+        if (sq_ok) tests_passed++; else tests_failed++;
+
+        /* Verify range: after ReLU [0,80], square should be [0,6400] */
+        int16_t sq_max = 0;
+        for (int i = 0; i < n; i++) if (dst_i16[i] > sq_max) sq_max = dst_i16[i];
+        printf("  Square range:  [0, %d] (expect <= 6400) %s\n",
+               sq_max, sq_max <= 6400 ? "OK" : "OVERFLOW");
+        if (sq_max <= 6400) tests_passed++; else tests_failed++;
+
+        /* ---- Residual ADD ---- */
+        shirley_residual_add_i16(dst_i16, a, b, n);
+        int add_ok = 1;
+        int16_t add_max = 0;
+        for (int i = 0; i < n; i++) {
+            int16_t expected = (int16_t)a[i] + (int16_t)b[i];
+            if (dst_i16[i] != expected) { add_ok = 0; break; }
+            int16_t abs_v = dst_i16[i] > 0 ? dst_i16[i] : -dst_i16[i];
+            if (abs_v > add_max) add_max = abs_v;
+        }
+        printf("  Residual ADD:  %s (max_abs=%d, expect <= 160)\n",
+               add_ok ? "PASS" : "FAIL", add_max);
+        if (add_ok) tests_passed++; else tests_failed++;
+
+        /* ---- Requantize i16 → i8 ---- */
+        shirley_residual_add_i16(dst_i16, a, b, n);  /* get i16 residual */
+        float rq_scale = shirley_requantize_i16_to_i8(dst_i8, dst_i16, n, 80);
+        int rq_ok = 1;
+        for (int i = 0; i < n; i++) {
+            if (dst_i8[i] > 80 || dst_i8[i] < -80) { rq_ok = 0; break; }
+        }
+        /* Verify round-trip: dequantize and compare to original i16 values */
+        float rq_max_err = 0.0f;
+        for (int i = 0; i < n; i++) {
+            float original = (float)dst_i16[i];  /* from the residual add */
+            float reconstructed = (float)dst_i8[i] * rq_scale;
+            float err = fabsf(original) > 1e-6f ?
+                fabsf((reconstructed - original) / original) : fabsf(reconstructed);
+            if (err > rq_max_err) rq_max_err = err;
+        }
+        /* Round-trip error is relative — large for small values near zero
+         * (quantization step ~2 on range ±160 → ±80). Use absolute error instead. */
+        float rq_max_abs_err = 0.0f;
+        for (int j = 0; j < n; j++) {
+            float orig = (float)dst_i16[j];
+            float recon = (float)dst_i8[j] * rq_scale;
+            float ae = fabsf(recon - orig);
+            if (ae > rq_max_abs_err) rq_max_abs_err = ae;
+        }
+        printf("  Requantize:    %s (scale=%.2f, max_abs_err=%.2f, step=%.2f)\n",
+               rq_ok ? "PASS" : "FAIL", rq_scale, rq_max_abs_err, rq_scale);
+        /* Max abs error should be <= one quantization step (rq_scale) */
+        if (rq_ok && rq_max_abs_err <= rq_scale + 0.01f) tests_passed++; else tests_failed++;
+
+        /* ---- Element-wise MUL (gate² × up) ---- */
+        shirley_relu_i8(relu_out, a, n);
+        shirley_square_i8_to_i16(sq, relu_out, n);
+
+        float mul_scale = shirley_mul_i16_i8_to_i8(dst_i8, sq, b, n, 80);
+        int mul_ok = 1;
+        for (int i = 0; i < n; i++) {
+            if (dst_i8[i] > 80 || dst_i8[i] < -80) { mul_ok = 0; break; }
+        }
+        /* Verify against float64 reference */
+        float mul_max_err = 0.0f;
+        for (int i = 0; i < n; i++) {
+            double ref = (double)sq[i] * (double)b[i];
+            double reconstructed = (double)dst_i8[i] * (double)mul_scale;
+            double err = fabs(ref) > 1e-6 ?
+                fabs((reconstructed - ref) / ref) : fabs(reconstructed);
+            if ((float)err > mul_max_err) mul_max_err = (float)err;
+        }
+        /* Same: use absolute error bounded by quantization step */
+        float mul_max_abs_err = 0.0f;
+        for (int j = 0; j < n; j++) {
+            double ref = (double)sq[j] * (double)b[j];
+            double recon = (double)dst_i8[j] * (double)mul_scale;
+            double ae = fabs(recon - ref);
+            if ((float)ae > mul_max_abs_err) mul_max_abs_err = (float)ae;
+        }
+        printf("  Elem MUL:      %s (scale=%.1f, max_abs_err=%.1f, step=%.1f)\n",
+               mul_ok ? "PASS" : "FAIL", mul_scale, mul_max_abs_err, mul_scale);
+        if (mul_ok && mul_max_abs_err <= mul_scale + 0.01f) tests_passed++; else tests_failed++;
+
+        /* ---- Full FFN fragment: ReLU → Square → MUL(gate², up) ---- */
+        {
+            int8_t *gate = (int8_t *)malloc(n);
+            int8_t *up = (int8_t *)malloc(n);
+            int8_t *gate_relu = (int8_t *)malloc(n);
+            int16_t *gate_sq = (int16_t *)malloc(n * sizeof(int16_t));
+            int8_t *ffn_out = (int8_t *)malloc(n);
+
+            srand(99);
+            for (int i = 0; i < n; i++) {
+                gate[i] = (int8_t)((rand() % 161) - 80);
+                up[i] = (int8_t)((rand() % 161) - 80);
+            }
+
+            shirley_relu_i8(gate_relu, gate, n);
+            shirley_square_i8_to_i16(gate_sq, gate_relu, n);
+            float ffn_scale = shirley_mul_i16_i8_to_i8(ffn_out, gate_sq, up, n, 80);
+
+            /* Verify against float64 reference of full chain */
+            float chain_max_err = 0.0f;
+            int chain_ok = 1;
+            for (int i = 0; i < n; i++) {
+                if (ffn_out[i] > 80 || ffn_out[i] < -80) { chain_ok = 0; break; }
+                double g = (double)gate[i];
+                double u = (double)up[i];
+                double ref = (g > 0 ? g * g : 0) * u;  /* relu(gate)² × up */
+                double recon = (double)ffn_out[i] * (double)ffn_scale;
+                double err = fabs(ref) > 1e-6 ?
+                    fabs((recon - ref) / ref) : fabs(recon);
+                if ((float)err > chain_max_err) chain_max_err = (float)err;
+            }
+            float chain_max_abs_err = 0.0f;
+            for (int j = 0; j < n; j++) {
+                double g = (double)gate[j];
+                double u = (double)up[j];
+                double ref2 = (g > 0 ? g * g : 0) * u;
+                double recon2 = (double)ffn_out[j] * (double)ffn_scale;
+                double ae = fabs(recon2 - ref2);
+                if ((float)ae > chain_max_abs_err) chain_max_abs_err = (float)ae;
+            }
+            printf("  FFN chain:     %s (relu→sq→mul, max_abs_err=%.1f, step=%.1f)\n",
+                   chain_ok ? "PASS" : "FAIL", chain_max_abs_err, ffn_scale);
+            if (chain_ok && chain_max_abs_err <= ffn_scale + 0.01f) tests_passed++; else tests_failed++;
+
+            free(gate); free(up); free(gate_relu); free(gate_sq); free(ffn_out);
+        }
+
+        /* ---- Performance ---- */
+        {
+            struct timespec t0, t1;
+            int iters = 100000;
+
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            for (int it = 0; it < iters; it++) shirley_relu_i8(dst_i8, a, n);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double relu_ns = elapsed_us(t0, t1) * 1000.0 / iters;
+
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            for (int it = 0; it < iters; it++) shirley_square_i8_to_i16(dst_i16, dst_i8, n);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double sq_ns = elapsed_us(t0, t1) * 1000.0 / iters;
+
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            for (int it = 0; it < iters; it++) shirley_residual_add_i16(dst_i16, a, b, n);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double add_ns = elapsed_us(t0, t1) * 1000.0 / iters;
+
+            printf("\n  --- Performance (n=%d) ---\n", n);
+            printf("  ReLU:          %6.0f ns (%.2f ns/elem)\n", relu_ns, relu_ns/n);
+            printf("  Square:        %6.0f ns (%.2f ns/elem)\n", sq_ns, sq_ns/n);
+            printf("  Residual ADD:  %6.0f ns (%.2f ns/elem)\n", add_ns, add_ns/n);
+            tests_passed++;
+        }
+
+        free(a); free(b); free(dst_i8); free(dst_i16); free(sq); free(relu_out);
+    }
+
     printf("\n==============================\n");
     printf("Results: %d passed, %d failed\n", tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
