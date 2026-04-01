@@ -225,16 +225,48 @@ If EXP and LOG can be approximated with sufficient precision using frozen shapes
 
 The precision threshold: can a frozen shape approximate `exp(x)` and `log(x)` to within MTFP21's 25.4-bit mantissa resolution using ternary lookup + interpolation? If yes, the entire compute fabric runs on one substrate. If no, the transcendentals dispatch to the iGPU as originally designed — still a win, just not full unification.
 
-## Implementation Priority
+## Implementation Status
 
-1. **Define the byte-per-trit compute format** — 16-byte mantissa + 5-byte exponent arrays
-2. **Implement multiply** — `sign_epi8` + exponent add. Simplest operation, highest value.
-3. **Implement add** — exponent alignment + mantissa add + normalization. Most complex operation.
-4. **Implement compare, negate, abs** — single-cycle operations.
-5. **Implement pack/unpack** — convert between compute format and 6-byte storage format.
-6. **Validate against float32** — exhaustive comparison on arithmetic operations, measure maximum error.
-7. **Benchmark** — throughput comparison: MTFP21 integer pipeline vs float32 FPU pipeline.
+MTFP21 is **fully implemented and validated** in `bitnet/shirley_mtfp21.h` (102/102 tests pass):
+
+- Conversion: float32 ↔ MTFP21, int8 ↔ MTFP21 (exact round-trip for all trit ranges)
+- Arithmetic: add (with exponent alignment), multiply (single-shot normalization), negate, abs
+- Division: integer reciprocal multiply (no float), scalar and general variants
+- rsqrt: 256-entry precomputed LUT + 2 Newton-Raphson iterations, zero float ops, max error 8.94e-08
+- RMSNorm: pure MTFP21 path (zero float between conversion boundaries), 100% exact match vs float64
+- Accumulation: statistically better than float32 (wins 57.2% of 1000 head-to-head comparisons)
+- Adversarial: passes all 6 distributions (heavy tails, near-zero, bimodal, cancellation, dynamic range, all-same)
+
+### Correction: Multiply spec
+
+The original spec described multiply as `sign_epi8(a.mantissa, b.mantissa)` — element-wise trit multiplication. This is only correct when one operand is a single ternary weight {-1, 0, +1} (the matmul case). General MTFP21 × MTFP21 uses int32 mantissa multiplication in int64 with single-shot normalization. The implementation uses the correct general algorithm.
+
+## Architectural Role: Transport, Not Compute
+
+MTFP21 was originally designed as a universal compute format — the per-element arithmetic for all operations. **Profiling showed this is 142,000 ns per RMSNorm (n=2560), 65x slower than float32.** The overhead comes from per-element normalization (iterative divide-by-3 loops, exponent alignment) that the hardware doesn't accelerate.
+
+The correct architecture separates representation from compute:
+
+```
+Layer 1: AVX2 integer kernels    Per-element bulk work (sign_epi8, mullo, mulhrs)
+         417 ns per RMSNorm      32 elements/cycle, native hardware
+
+Layer 2: Scalar arithmetic       One-off computations (rsqrt, division)
+         FPU (5 ns) or MTFP21 LUT+NR (200 ns) or iGPU
+
+Layer 3: MTFP21 transport        Scale factors, normalization parameters, metadata
+         25.4-bit precision      Values computed once, applied many times
+```
+
+MTFP21 sits at Layer 3. It stores the scalar results of Layer 2 computations (rsqrt values, reciprocals, scale factors) and transports them between Layer 1 compute stages. It does NOT perform the per-element squaring, accumulation, or scaling — those use raw AVX2 integer at Layer 1.
+
+The `shirley_rmsnorm_ternary` kernel demonstrates this architecture:
+- Phase 1+2: AVX2 int8→int16→int32 sum of squares (Layer 1)
+- Phase 3: MTFP21 integer rsqrt via LUT+NR (Layer 2/3)
+- Phase 4: MTFP21→Q15 fixed-point conversion (Layer 3→1 bridge)
+- Phase 5: AVX2 `_mm256_mulhrs_epi16` scale + pack (Layer 1)
+- Result: 417 ns, zero float, 100% exact, faster than the float path
 
 ## Origin
 
-Conceived March 31, 2026 during Shirley project design. The name is a reference to blackjack — 21 is where precision, range, and hardware alignment hit the sweet spot.
+Conceived March 31, 2026 during Shirley project design. Implemented April 1, 2026. Repositioned from compute format to transport format after profiling revealed 65x overhead vs float32 for per-element operations. The proof of concept (102/102 tests, better-than-float32 accumulation) validates the number system; the three-layer architecture puts it where it belongs.

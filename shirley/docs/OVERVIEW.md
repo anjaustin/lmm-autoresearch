@@ -93,20 +93,52 @@ See `MTFP21.md` for the full specification.
 
 ## Validation: BitNet b1.58-2B-4T (2026-04-01)
 
-The Shirley thesis was tested on a real 2-billion-parameter language model (Microsoft BitNet b1.58-2B-4T) using the autoresearch protocol. 11 experiments across 6 of 8 planned phases.
+The Shirley thesis was tested on a real 2-billion-parameter language model (Microsoft BitNet b1.58-2B-4T) using the autoresearch protocol. Two sessions of experiments across 6 of 8 planned phases, with architecture audit and kernel development.
 
-**Key results:**
+**Key results (corrected after Session 002 real-integer validation):**
 
 - `sign_epi8` produces mathematically identical results to the existing `maddubs_epi16` kernel — the ternary multiply instruction works as the native matmul primitive
-- **4-trit (81-level) activation quantization survives all 28 transformer layers** with no perplexity degradation. The precision floor is between 3 and 4 trits.
-- SiLU activation function output is **naturally ternary-compatible** — quantizing it to 4 trits has literally zero effect on perplexity
-- RMSNorm output is the **precision bottleneck** — needs 7 trits (2187 levels) where everything else survives at 4
+- **5-trit (~161-level) activation quantization is the real floor for generation quality.** Simulation predicted 4-trit; real integer quantization showed 4-trit passes perplexity but causes repetitive generation. PPL alone is insufficient — distribution shape matters. (Session 002 finding)
+- **The model uses ReLU-squared, not SiLU.** The earlier "SiLU is free" finding was testing a code path that doesn't exist in this architecture. ReLU-squared (MAX + MUL) is composed entirely of CPU-native primes. (Session 002 architecture audit)
+- RMSNorm output is the **precision bottleneck** — simulation shows 7 trits needed (unvalidated with real integer compute; may need correction like the 4-trit finding)
 - Residual connections are exact in integer (int16 range sufficient for 28 layers)
-- A non-monotonic anomaly at the 3^3 = 27 quantization boundary suggests ternary-aligned granularities interact favorably with the model's ternary weight structure
+- Attention Q@K^T and attn@V are **float×float, not ternary.** Only the projection matmuls (wq, wk, wv, wo, gate, up, down) are ternary. (Session 002 audit)
+- 4 RMSNorms per layer (attn, attn_sub, ffn, ffn_sub), not 2. (Session 002 audit)
 
-The entire linear compute path — matmul, residual ADD, element-wise multiply, and activation functions — can operate at 4-trit precision. The only operation requiring higher precision is RMSNorm (one rsqrt per row). If the integer rsqrt can be computed at 7-trit precision, the full ternary inference pipeline is viable.
+**Three-layer compute stack (LEMM-derived architecture):**
 
-Full results: `BITNET_TERNARY_PLAN.md`. Experiment log: `../bitnet/results.tsv`. Journal: `../bitnet/journal/session_001.md`.
+```
+Layer 1: AVX2 integer kernels     sign_epi8, mullo_epi16, mulhrs_epi16
+         32 elements/cycle, per-element bulk work
+
+Layer 2: Scalar FPU or iGPU       sqrtf for rsqrt, V_EXP_F32 for softmax
+         Transcendentals called once, not per-element
+
+Layer 3: MTFP21 transport format   Scale factors, normalization parameters
+         25.4-bit precision, balanced ternary representation
+```
+
+**AVX2 kernel results (shirley_kernels.h):**
+
+| Kernel | Time (n=2560) | Float ops | Notes |
+|--------|--------------|-----------|-------|
+| `shirley_rmsnorm_ternary` | 417 ns | **zero** | End-to-end ternary, MTFP21 rsqrt + Q15 scale |
+| `shirley_rmsnorm_f32` | 430 ns | all float | 8x faster than ggml scalar, with gamma |
+| ggml scalar RMSNorm | 3,300 ns | all float | Current BitNet baseline |
+| MTFP21 scalar | 142,000 ns | zero | Proof of concept, not production |
+
+The end-to-end ternary kernel (`shirley_rmsnorm_ternary`) is **faster than the float path** because `_mm256_mulhrs_epi16` (Q15 multiply-round-shift) is one instruction where float needs three (convert, multiply, convert back). Zero float operations between int8 input and int8 output.
+
+**MTFP21 validation (shirley_mtfp21.h):**
+
+102/102 tests pass. Integer-only arithmetic that exceeds float32 precision:
+- Accumulation: MTFP21 wins 57.2% of 1000 head-to-head comparisons vs float32
+- rsqrt: 256-entry LUT + 2 Newton-Raphson iterations, max error 8.94e-08, zero float
+- RMSNorm: 100% exact match against float64 reference through full int8→MTFP21→int8 pipeline
+
+MTFP21 is validated as a number system but too slow for per-element compute (scalar int64 loops). Its role: transport format between compute stages, iGPU interface, and proof that integer-only inference arithmetic works at full precision.
+
+Full results: `BITNET_TERNARY_PLAN.md`. Journals: `../bitnet/journal/`, `../journal/`. Kernel code: `../bitnet/shirley_kernels.h`.
 
 ## Research Questions
 

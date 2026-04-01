@@ -227,27 +227,82 @@ Softmax            TBD               Expected to be fine (shift-invariant)
 Embeddings         TBD               Untested
 ```
 
-The entire linear compute path (matmul + residual + element-wise multiply + activation functions) can go ternary at 4-trit precision. The only bottleneck is RMSNorm, which needs 7 trits. If the integer rsqrt can be computed at that precision, the full ternary pipeline is viable.
+The linear compute path can go ternary at ~5-trit precision for matmul activations (corrected from 4-trit after real integer validation — see Session 002 below). RMSNorm needs 7 trits (simulation only, unvalidated). The integer rsqrt is solved: 256-entry LUT + 2 NR iterations, 0.2 us, zero float.
+
+## Session 002 Corrections (2026-04-01)
+
+Session 002 audited the actual model architecture and validated findings with real integer compute (not simulation).
+
+### CRITICAL CORRECTIONS:
+
+**1. The model uses ReLU-squared, NOT SiLU.** The `LLM_FFN_RELU_SQR` flag in the forward pass (`build_bitnet_158()`) calls `ggml_relu` + `ggml_sqr`, not `ggml_silu`. The "SiLU is free" finding from Session 1 was testing a code path that doesn't exist. ReLU-squared (MAX + MUL) is composed entirely of CPU-native primes — good for ternary, but the SiLU claim is invalid.
+
+**2. Real activation precision floor is 5-trit, not 4-trit.** Modified `quantize_row_i8_s` to clamp to RANGE=40 (81 levels, 4-trit). PPL 18.91 — fine. Generation: repetitive loops on some prompts. A/B comparison with same seed: baseline produces diverse text, 4-trit loops. RANGE=80 (~161 levels, ~5-trit) recovers generation quality. **Perplexity is blind to distribution shape distortion.** The simulation (quantize-dequantize in float32) did not predict this failure.
+
+**3. Attention matmuls are NOT ternary.** Q@K^T and attn@V operate on float32 tensors (Q, K, V are float after RoPE). Only the projection matmuls (wq, wk, wv, wo, ffn_gate, ffn_up, ffn_down) use ternary weights × int8 activations.
+
+**4. There are 4 RMSNorms per layer, not 2:** attn_norm, attn_sub_norm, ffn_norm, ffn_sub_norm.
+
+**5. RoPE uses sin/cos** — transcendental operations on Q and K after projection. Precomputable for fixed positions.
+
+### Architecture audit: exact per-layer computation graph
+
+```
+Operation                    Ternary?  Validated?
+──────────────────────────   ────────  ──────────
+RMSNorm (attn)               float32   SIM ONLY
+matmul: wq, wk, wv × norm   INT       REAL (sign_epi8)
+RoPE on Q, K                 float32   UNTESTED
+Q @ K^T (attention scores)   float32   N/A (float×float)
+softmax(scores)              float32   UNTESTED
+attn_weights @ V             float32   N/A (float×float)
+RMSNorm (attn sub)           float32   SIM ONLY
+matmul: wo × sub_norm        INT       REAL
+Residual ADD (attn)          float32   exact in integer
+RMSNorm (FFN)                float32   SIM ONLY
+matmul: gate, up × norm      INT       REAL
+ReLU-squared(gate)           float32   UNTESTED (MAX+MUL, CPU-native)
+gate × up (element-wise)     float32   UNTESTED
+RMSNorm (FFN sub)            float32   SIM ONLY
+matmul: down × sub_norm      INT       REAL
+Residual ADD (FFN)           float32   exact in integer
+```
+
+## AVX2 Kernel Development (2026-04-01)
+
+Three kernel variants built and validated (`bitnet/shirley_kernels.h`):
+
+| Kernel | Input→Output | Float ops | Time (n=2560) |
+|--------|-------------|-----------|--------------|
+| `shirley_rmsnorm_ternary` | int8→int8 | **zero** | **417 ns** |
+| `shirley_rmsnorm_f32` | float32→float32 | all float | 430 ns |
+| `shirley_rmsnorm_quantize` | float32→int8 | hybrid | 9.8 us |
+
+The ternary kernel uses MTFP21 integer rsqrt (LUT+NR) for the scale computation and `_mm256_mulhrs_epi16` (Q15 multiply-round-shift) for the per-element scaling. Zero float between int8 input and int8 output. Faster than the float path because Q15 is one instruction where float needs three (convert, multiply, convert back).
+
+Gamma weights supported via Q14 fixed-point (scalar path, ~4.8 us with gamma).
 
 ## Original Expected Outcome (for reference)
 
-> The matmul swap (Phase 1) should be clean — we're just changing the encoding from {0,1,2} to {-1,0,+1} and using a faster instruction. No precision change.
+> The matmul swap (Phase 1) should be clean.
 
 **Confirmed.** PPL identical.
 
-> The activation quantization (Phase 2) is the big unknown. If 5-trit survives 28 layers, the entire linear compute path goes ternary integer. If it doesn't, we'll know the precision floor and can use MTFP21 or a higher trit count.
+> The activation quantization (Phase 2) is the big unknown. If 5-trit survives 28 layers, the entire linear compute path goes ternary integer.
 
-**Better than expected.** Not just 5-trit — 4-trit survives. MTFP21 is not needed for activations.
+**Corrected.** 5-trit survives. 4-trit does not (generation quality). The simulation predicted 4-trit; real integer validation corrected to 5-trit.
 
-> The transcendentals (Phases 5-7) are the hardest. These are where the iGPU earns its place — or where frozen shape approximation proves itself.
+> The transcendentals (Phases 5-7) are the hardest.
 
-**Partially answered.** RMSNorm needs 7-trit precision (the sqrt/rsqrt is the real constraint). SiLU is free. Softmax untested. The iGPU may still be valuable for the rsqrt computation, but a lookup table or integer Newton-Raphson may suffice.
+**Partially answered.** RMSNorm rsqrt solved in integer (LUT+NR, 0.2 us). Model uses ReLU-squared (not SiLU) — no transcendental needed for the activation function. Softmax EXP untested — this is where the iGPU may earn its place (156M EXP operations per forward pass).
 
-## Infrastructure (completed)
+## Infrastructure
 
-- [x] BitNet b1.58-2B-4T model on this machine (GGUF, I2_S quantization)
-- [x] BitNet.cpp building and running baseline inference (27 tok/s)
-- [x] Fixed eval set for perplexity measurement (WikiText-2 raw, 20 chunks, ctx=512)
-- [x] Build system that lets us swap individual operations (compile-time flags)
-- [x] Baseline measurements recorded (PPL 18.852, 78 tok/s prompt eval, 2014 MB RSS)
-- [ ] Fixed prompt set for qualitative comparison (not yet created)
+- [x] BitNet b1.58-2B-4T model (GGUF I2_S, 1.2GB)
+- [x] Baseline inference (27 tok/s generation, 78 tok/s prompt eval)
+- [x] WikiText-2 eval (20 chunks ctx=512 and 50 chunks for extended validation)
+- [x] Compile-time flags for activation quantization (SHIRLEY_ACT_RANGE, SHIRLEY_5TRIT_QUANT)
+- [x] AVX2 kernel library (`shirley_kernels.h`, `shirley_mtfp21.h`)
+- [x] Test suites (31/31 kernel tests, 102/102 MTFP21 tests)
+- [ ] Pipeline integration (kernel not yet substituted into actual BitNet inference)
+- [ ] Fixed prompt set for qualitative generation comparison

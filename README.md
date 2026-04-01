@@ -20,9 +20,14 @@ For the full protocol, design rationale, and hardening analysis, see [`AUTORESEA
 
 ## Applied: BitNet ternary conversion (Shirley)
 
-This protocol has been applied to the [BitNet b1.58-2B-4T](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf) end-to-end ternary conversion — replacing float32 operations with ternary integer operations in a 2B-parameter LLM, one operation at a time. 11 experiments across 6 phases mapped the precision requirements of every operation in the transformer pipeline.
+This protocol has been applied to the [BitNet b1.58-2B-4T](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf) end-to-end ternary conversion — replacing float32 operations with ternary integer operations in a 2B-parameter LLM. Two experiment sessions, architecture audit, MTFP21 number system validation, and AVX2 kernel development.
 
-Key finding: 4 balanced ternary trits (81 levels, 6.3 bits) is sufficient for matmul outputs and activation functions across all 28 layers. Only RMSNorm requires higher precision (7 trits). See [`shirley/docs/BITNET_TERNARY_PLAN.md`](shirley/docs/BITNET_TERNARY_PLAN.md) for the full plan and results.
+Key findings:
+- **5-trit (~161 levels) is the real activation precision floor** for generation quality. Simulation predicted 4-trit; real integer validation showed 4-trit causes repetitive generation despite good perplexity. PPL alone is insufficient.
+- **End-to-end ternary RMSNorm kernel: 417 ns, zero float ops, faster than float32.** Three-layer compute stack: AVX2 integer for bulk work, MTFP21 integer rsqrt for the one transcendental, Q15 fixed-point for scaling.
+- **MTFP21 arithmetic validated** at 102/102 tests, better than float32 for accumulation, but repositioned as transport format (not compute format) after profiling showed 65x overhead for per-element operations.
+
+See [`shirley/docs/OVERVIEW.md`](shirley/docs/OVERVIEW.md) for the full architecture and [`shirley/docs/BITNET_TERNARY_PLAN.md`](shirley/docs/BITNET_TERNARY_PLAN.md) for the conversion plan and results.
 
 ## How it works
 
