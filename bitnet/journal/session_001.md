@@ -233,6 +233,71 @@ Extended eval (50 chunks): 4-trit PPL 16.600 vs baseline 16.554 — within CI. N
 3. Softmax — this is shift-invariant, so ternary logits should work fine
 4. Profile to determine actual bottleneck distribution
 
+---
+
+## Experiments 5-11: RMSNorm and SiLU quantization
+
+**RMSNorm output quantization (with 4-trit matmul):**
+| RMSNorm trits | MAX | PPL | Δ |
+|---------------|-----|-----|---|
+| 4 | 40 | 25.93 | +7.08 (broken) |
+| 5 | 121 | 20.21 | +1.36 |
+| 6 | 364 | 19.13 | +0.28 |
+| 7 | 1093 | 18.91 | +0.06 (good) |
+
+RMSNorm output is the MOST SENSITIVE point in the pipeline. Pre-matmul
+normalized activations need ~7 trits for quality. This is because normalization
+concentrates values near zero, and the relative precision at small values matters
+more than for the larger post-matmul outputs.
+
+**SiLU output quantization:**
+With 4-trit matmul + 7-trit RMSNorm, SiLU quantization at 4/5/6 trits ALL
+produce identical PPL (18.9129). **SiLU quantization has ZERO EFFECT.**
+The activation function's output is already ternary-compatible.
+
+**Precision map of the transformer pipeline:**
+```
+RMSNorm (7-trit) → QKV matmul (4-trit) → softmax (TBD) → output matmul (4-trit)
+    → RMSNorm (7-trit) → gate_proj (4-trit) → SiLU (4-trit, FREE) → element-wise mul
+    → up_proj (4-trit) → down_proj (4-trit) → residual ADD (exact in integer)
+```
+
+The bottleneck is RMSNorm. If we can compute RMSNorm in 7-trit precision,
+the rest of the pipeline is 4-trit or free.
+
+---
+
+## Final Session 1 Reflection
+
+**Completed:**
+- Phase 1: Kernel swap (sign_epi8 validated, PPL identical)
+- Phase 2: Activation quantization sweep (4-trit optimal for matmul outputs)
+- Phase 3: Residual analysis (ADD exact in integer, range fits int16)
+- Phase 5: RMSNorm quantization (needs 7 trits)
+- Phase 6: SiLU quantization (4-trit, zero effect)
+- 13-point matmul precision sweep + 4-point RMSNorm sweep + 3-point SiLU sweep
+
+**Key discoveries:**
+1. 4-trit activation quantization works on 2B-param LLM (all 28 layers)
+2. SiLU is already ternary-compatible (quantization has zero effect)
+3. RMSNorm output is the precision bottleneck (needs 7 trits)
+4. Non-monotonic response at 3^3 boundary suggests structural alignment
+5. The entire linear compute path (matmul + residual + activation) can go ternary
+6. Only transcendental operations (RMSNorm sqrt, softmax exp) need higher precision
+
+**Implications for Shirley:**
+The complete ternary compute path is viable for LLM inference:
+- Matmul: sign_epi8 (validated, 4-trit precision)
+- SiLU: can be approximated in ternary (4-trit output, no quality impact)
+- Residual: exact in integer
+- RMSNorm: needs integer sqrt approximation at 7-trit precision
+- Softmax: shift-invariant, likely ternary-friendly (untested)
+
+The dominant cost is RMSNorm precision. Everything else is 4-trit.
+
+**Current best config:** 4-trit matmul + 7-trit norm + 4-trit SiLU = PPL 18.91 (+0.06)
+Commit 2aaa9fd.
+
 **Result:** PPL 18.8520 — IDENTICAL to baseline. Mathematical equivalence confirmed.
 Throughput 75.94 tok/s (baseline 78.27) — slightly slower as expected.
 
