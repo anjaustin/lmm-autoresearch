@@ -19,5 +19,8 @@ AGENTS.md
 # Experimental code/artifacts
 dev/
 
-# Results file
+# Autoresearch runtime artifacts
 results.tsv
+strategy_override.md
+journal/
+run.log
