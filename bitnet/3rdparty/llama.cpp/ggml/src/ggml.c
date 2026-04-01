@@ -12156,6 +12156,14 @@ static void ggml_compute_forward_rms_norm_f32(
                  * Same float32 in/out, no gamma (gamma is a separate ggml_mul).
                  * Uses AVX2 vectorized sum-of-squares and scale. */
                 shirley_rmsnorm_f32_inline(y, x, (int)ne00, eps);
+                /* Log once that Shirley kernel is active */
+                {
+                    static int shirley_logged = 0;
+                    if (!shirley_logged) {
+                        fprintf(stderr, "shirley: AVX2 RMSNorm kernel active\n");
+                        shirley_logged = 1;
+                    }
+                }
 #else
                 ggml_float sum = 0.0;
                 for (int64_t i00 = 0; i00 < ne00; i00++) {
