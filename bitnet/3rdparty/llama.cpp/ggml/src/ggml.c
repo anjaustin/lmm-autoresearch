@@ -11729,6 +11729,30 @@ static void ggml_compute_forward_silu_f32(
                 (float *) ((char *) dst->data  + i1*( dst->nb[1])),
                 (float *) ((char *) src0->data + i1*(src0->nb[1])));
 
+#ifdef SHIRLEY_5TRIT_QUANT
+        // Quantize SiLU output
+        {
+            float * y = (float *) ((char *) dst->data + i1*(dst->nb[1]));
+            float max_abs = 0.0f;
+            for (int k = 0; k < nc; k++) {
+                float a = fabsf(y[k]);
+                if (a > max_abs) max_abs = a;
+            }
+            if (max_abs > 1e-10f) {
+#ifndef SHIRLEY_SILU_TRIT_MAX
+#define SHIRLEY_SILU_TRIT_MAX 121.0f
+#endif
+                float s5t = SHIRLEY_SILU_TRIT_MAX / max_abs;
+                for (int k = 0; k < nc; k++) {
+                    float v = y[k] * s5t;
+                    if (v > SHIRLEY_SILU_TRIT_MAX) v = SHIRLEY_SILU_TRIT_MAX;
+                    if (v < -SHIRLEY_SILU_TRIT_MAX) v = -SHIRLEY_SILU_TRIT_MAX;
+                    y[k] = roundf(v) / s5t;
+                }
+            }
+        }
+#endif
+
 #ifndef NDEBUG
         for (int k = 0; k < nc; k++) {
             const float x = ((float *) ((char *) dst->data + i1*(dst->nb[1])))[k];
