@@ -12236,7 +12236,6 @@ static void ggml_compute_forward_rms_norm_f32(
                 const float scale = 1.0f/sqrtf(mean + eps);
 
                 ggml_vec_scale_f32(ne00, y, scale);
-#endif
 
 #ifdef SHIRLEY_5TRIT_QUANT
                 // Quantize RMSNorm output to ternary precision
