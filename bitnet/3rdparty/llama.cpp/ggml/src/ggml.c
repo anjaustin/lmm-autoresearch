@@ -12504,14 +12504,35 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 if (src0->type == GGML_TYPE_I2_S && iir0 + blck_0 - 1 < ir0_end) {
                     // 16 rows per vector dot product, so we can process 16 rows at a time blck == 16
                     // this is a bit of a hack, we should probably have a better way to handle this
-                    vec_dot(ne00, &tmp[0], 1, 
-                        src0_row + iir0 * nb01 / 4, nb01, 
+                    vec_dot(ne00, &tmp[0], 1,
+                        src0_row + iir0 * nb01 / 4, nb01,
                         src1_col_de, 0, 16);
-                    
+
                     // post compute activation scaling
                     for (int row = 0; row < 16; row++) {
                         tmp[row] = (tmp[row]) / (act_scales[i1]) * (*scale);
                     }
+
+#ifdef SHIRLEY_5TRIT_QUANT
+                    // 5-trit activation quantization: simulate precision reduction
+                    // 5 balanced ternary trits = 243 states = integers in [-121, 121]
+                    {
+                        float max_abs = 0.0f;
+                        for (int row = 0; row < 16; row++) {
+                            float a = fabsf(tmp[row]);
+                            if (a > max_abs) max_abs = a;
+                        }
+                        if (max_abs > 1e-10f) {
+                            float s5t = 121.0f / max_abs;
+                            for (int row = 0; row < 16; row++) {
+                                float v = tmp[row] * s5t;
+                                if (v > 121.0f) v = 121.0f;
+                                if (v < -121.0f) v = -121.0f;
+                                tmp[row] = roundf(v) / s5t;
+                            }
+                        }
+                    }
+#endif
                 }
                 else
                 {
@@ -13265,10 +13286,29 @@ UseGgmlGemm2:;
                 gemm(ne00, &tmp[0], src0_end - src0_start, (const char *) src0->data + src0_start * nb01 / 4,
                     (const char *) src1_wdata, ne11 - ne11 % 4, src0_end - src0_start);
                 for (int col = 0; col < ne11 - ne11 % 4; col++) {
-                    for (int row = 0; row < src0_end - src0_start; row++) {
-                        tmp[col * (src0_end - src0_start) + row] = (tmp[col * (src0_end - src0_start) + row]) / (act_scales[col]) * (*scale);
+                    int64_t n_rows = src0_end - src0_start;
+                    for (int row = 0; row < n_rows; row++) {
+                        tmp[col * n_rows + row] = (tmp[col * n_rows + row]) / (act_scales[col]) * (*scale);
                     }
-                    memcpy((float *)((char *) dst->data + (col * nb1)) + src0_start, tmp + col * (src0_end - src0_start), (src0_end - src0_start) * sizeof(float));
+#ifdef SHIRLEY_5TRIT_QUANT
+                    {
+                        float max_abs = 0.0f;
+                        for (int row = 0; row < n_rows; row++) {
+                            float a = fabsf(tmp[col * n_rows + row]);
+                            if (a > max_abs) max_abs = a;
+                        }
+                        if (max_abs > 1e-10f) {
+                            float s5t = 121.0f / max_abs;
+                            for (int row = 0; row < n_rows; row++) {
+                                float v = tmp[col * n_rows + row] * s5t;
+                                if (v > 121.0f) v = 121.0f;
+                                if (v < -121.0f) v = -121.0f;
+                                tmp[col * n_rows + row] = roundf(v) / s5t;
+                            }
+                        }
+                    }
+#endif
+                    memcpy((float *)((char *) dst->data + (col * nb1)) + src0_start, tmp + col * n_rows, n_rows * sizeof(float));
                 }
             }
             else {
@@ -13286,10 +13326,31 @@ UseGgmlGemm2:;
                     (const char *) src0->data + src0_start * nb01 / 4,
                     (const char *) src1_wdata + (src1_col_stride * iter),
                     1, src0_end - src0_start);
-                for (int row = 0; row < src0_end - src0_start; row++) {
-                    tmp[row] = (tmp[row]) / (act_scales[iter]) * (*scale);
+                {
+                    int64_t n_rows = src0_end - src0_start;
+                    for (int row = 0; row < n_rows; row++) {
+                        tmp[row] = (tmp[row]) / (act_scales[iter]) * (*scale);
+                    }
+#ifdef SHIRLEY_5TRIT_QUANT
+                    {
+                        float max_abs = 0.0f;
+                        for (int row = 0; row < n_rows; row++) {
+                            float a = fabsf(tmp[row]);
+                            if (a > max_abs) max_abs = a;
+                        }
+                        if (max_abs > 1e-10f) {
+                            float s5t = 121.0f / max_abs;
+                            for (int row = 0; row < n_rows; row++) {
+                                float v = tmp[row] * s5t;
+                                if (v > 121.0f) v = 121.0f;
+                                if (v < -121.0f) v = -121.0f;
+                                tmp[row] = roundf(v) / s5t;
+                            }
+                        }
+                    }
+#endif
+                    memcpy((float *)((char *) dst->data + (iter * nb1)) + src0_start, tmp, n_rows * sizeof(float));
                 }
-                memcpy((float *)((char *) dst->data + (iter * nb1)) + src0_start, tmp, (src0_end - src0_start) * sizeof(float));
             }
             else {
                 gemv(ne00, (float *)((char *) dst->data + (iter * nb1)) + src0_start, ne01,
