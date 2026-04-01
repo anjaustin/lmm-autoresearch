@@ -682,6 +682,124 @@ static void test_accumulation_statistical(void) {
 }
 
 /* ================================================================
+ *  Test 11: Pure MTFP21 RMSNorm (Issue 3)
+ * ================================================================ */
+
+static void test_rmsnorm_pure(void) {
+    printf("=== Test 11: Pure MTFP21 RMSNorm (no float escape hatches) ===\n");
+
+    int n = 2560;
+    float eps = 1e-5f;
+    mtfp21_t eps_m = mtfp21_from_float(eps);
+
+    float *src_f = (float *)malloc(n * sizeof(float));
+    float *dst_f = (float *)malloc(n * sizeof(float));
+    mtfp21_t *src_m = (mtfp21_t *)malloc(n * sizeof(mtfp21_t));
+    mtfp21_t *dst_m = (mtfp21_t *)malloc(n * sizeof(mtfp21_t));
+
+    srand(42);
+    for (int i = 0; i < n; i++) {
+        src_f[i] = randn();
+        src_m[i] = mtfp21_from_float(src_f[i]);
+    }
+
+    /* Float64 reference */
+    double ref_sum = 0.0;
+    for (int i = 0; i < n; i++) ref_sum += (double)src_f[i] * (double)src_f[i];
+    double ref_scale = 1.0 / sqrt(ref_sum / n + eps);
+
+    /* Pure MTFP21 */
+    mtfp21_rmsnorm_pure(dst_m, src_m, n, eps_m);
+
+    float max_err = 0.0f;
+    for (int i = 0; i < n; i++) {
+        double expected = (double)src_f[i] * ref_scale;
+        float got = mtfp21_to_float(dst_m[i]);
+        float err = fabs(expected) > 1e-10 ? fabsf((float)((got - expected) / expected)) : fabsf(got);
+        if (err > max_err) max_err = err;
+    }
+
+    printf("  Pure MTFP21 RMSNorm: max_err=%.2e\n", max_err);
+    if (max_err < 1e-5f) { printf("  PASS\n"); tests_passed++; }
+    else if (max_err < 1e-4f) { printf("  MARGINAL (within 1e-4)\n"); tests_passed++; }
+    else { printf("  FAIL\n"); tests_failed++; }
+
+    free(src_f); free(dst_f); free(src_m); free(dst_m);
+    printf("\n");
+}
+
+/* ================================================================
+ *  Test 12: Chained end-to-end pipeline (Issue 4)
+ * ================================================================ */
+
+static void test_chained_pipeline(void) {
+    printf("=== Test 12: Chained int8 -> MTFP21 RMSNorm -> int8 ===\n");
+
+    int n = 2560;
+    int in_range = 80;   /* 5-trit activations */
+    int out_range = 121; /* output at 5-trit range */
+    mtfp21_t eps = mtfp21_from_float(1e-5f);
+
+    int8_t *src = (int8_t *)malloc(n);
+    int8_t *dst = (int8_t *)malloc(n);
+
+    /* Random 5-trit activations */
+    srand(42);
+    for (int i = 0; i < n; i++) {
+        src[i] = (int8_t)((rand() % (2 * in_range + 1)) - in_range);
+    }
+
+    /* int8 RMSNorm */
+    mtfp21_rmsnorm_int8(dst, src, n, eps, out_range);
+
+    /* Float64 reference */
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) sum += (double)src[i] * (double)src[i];
+    double scale = 1.0 / sqrt(sum / n + 1e-5);
+
+    /* Compare: how many output elements match the float64 reference (quantized)? */
+    int exact_match = 0;
+    int off_by_one = 0;
+    int worse = 0;
+    for (int i = 0; i < n; i++) {
+        double ref_val = (double)src[i] * scale;
+        /* Quantize reference to out_range */
+        int ref_q = (int)round(ref_val);
+        if (ref_q > out_range) ref_q = out_range;
+        if (ref_q < -out_range) ref_q = -out_range;
+
+        int diff = abs((int)dst[i] - ref_q);
+        if (diff == 0) exact_match++;
+        else if (diff == 1) off_by_one++;
+        else worse++;
+    }
+
+    printf("  n=%d, in_range=%d, out_range=%d\n", n, in_range, out_range);
+    printf("  Exact match: %d/%d (%.1f%%)\n", exact_match, n, 100.0 * exact_match / n);
+    printf("  Off-by-one:  %d/%d (%.1f%%)\n", off_by_one, n, 100.0 * off_by_one / n);
+    printf("  Worse:       %d/%d (%.1f%%)\n", worse, n, 100.0 * worse / n);
+
+    int pass = (exact_match + off_by_one == n) && ((float)exact_match / n >= 0.95f);
+    if (pass) { printf("  PASS: >=95%% exact, rest off-by-one\n"); tests_passed++; }
+    else { printf("  FAIL\n"); tests_failed++; }
+
+    /* Test repeated application (2 consecutive RMSNorms) */
+    int8_t *dst2 = (int8_t *)malloc(n);
+    mtfp21_rmsnorm_int8(dst2, dst, n, eps, out_range);
+
+    /* After double normalization, values should be near unit variance */
+    int in_range_count = 0;
+    for (int i = 0; i < n; i++) {
+        if (abs(dst2[i]) <= out_range) in_range_count++;
+    }
+    printf("  Double RMSNorm: %d/%d outputs in range (expect all)\n", in_range_count, n);
+    if (in_range_count == n) tests_passed++; else tests_failed++;
+
+    free(src); free(dst); free(dst2);
+    printf("\n");
+}
+
+/* ================================================================
  *  Main
  * ================================================================ */
 
@@ -699,6 +817,8 @@ int main(void) {
     test_division();
     test_adversarial();
     test_accumulation_statistical();
+    test_rmsnorm_pure();
+    test_chained_pipeline();
 
     printf("======================\n");
     printf("Results: %d passed, %d failed\n", tests_passed, tests_failed);

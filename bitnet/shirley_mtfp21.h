@@ -473,7 +473,15 @@ static const struct { int32_t mant; int8_t exp; } RSQRT_LUT[256] = {
 };
 
 /* Integer-only rsqrt: LUT seed + 2 Newton-Raphson iterations.
- * No float operations. */
+ * No float operations.
+ *
+ * For input x = M * 3^E:
+ *   1/sqrt(x) = 1/sqrt(M) * 3^(-E/2)
+ *
+ * If E is even: 3^(-E/2) is a clean exponent shift.
+ * If E is odd:  E = 2k+1, so 3^(-E/2) = 3^(-k) * 3^(-1/2) = 3^(-k) / sqrt(3).
+ *               We multiply by INV_SQRT3 = {8284027, -15} ≈ 1/sqrt(3).
+ */
 static inline mtfp21_t mtfp21_rsqrt(mtfp21_t x) {
     if (x.mantissa <= 0) {
         mtfp21_t r = {0, 0};
@@ -483,44 +491,49 @@ static inline mtfp21_t mtfp21_rsqrt(mtfp21_t x) {
     /* Normalize mantissa to [MANT_MAX/3, MANT_MAX] */
     int32_t mant = x.mantissa;
     int exp = x.exponent;
-    while (mant > 0 && mant * 3 <= MTFP21_MANT_MAX && exp > -MTFP21_EXP_MAX) {
+    while (mant > 0 && (int64_t)mant * 3 <= MTFP21_MANT_MAX && exp > -MTFP21_EXP_MAX) {
         mant *= 3;
         exp--;
-    }
-
-    /* Handle odd exponent: multiply mantissa by 3, adjust exponent to even */
-    int odd_exp = exp & 1;
-    if (odd_exp) {
-        /* For odd exp, we need 1/sqrt(mant * 3^exp) = 1/sqrt(mant*3) * 3^(-(exp-1)/2) */
-        if ((int64_t)mant * 3 <= MTFP21_MANT_MAX) {
-            mant *= 3;
-            exp--;
-        } else {
-            /* mant*3 overflows — shift right instead */
-            mant = (mant + 1) / 3; /* round */
-            exp++;
-        }
     }
 
     /* LUT index from normalized mantissa */
     int32_t mant_min = MTFP21_MANT_MAX / 3; /* 7174453 */
     int32_t mant_range = MTFP21_MANT_MAX - mant_min; /* 14348907 */
-    int idx = (int)((int64_t)(mant - mant_min) * 256 / mant_range);
-    if (idx < 0) idx = 0;
-    if (idx > 255) idx = 255;
+    int idx;
+    if (mant <= mant_min) {
+        idx = 0;
+    } else {
+        idx = (int)((int64_t)(mant - mant_min) * 256 / mant_range);
+        if (idx > 255) idx = 255;
+    }
 
-    /* Seed from LUT */
+    /* Seed from LUT: gives 1/sqrt(mant) for the normalized mantissa */
     mtfp21_t y;
     y.mantissa = RSQRT_LUT[idx].mant;
-    y.exponent = RSQRT_LUT[idx].exp + (-exp / 2);
-    /* LUT was computed for mantissa-only (exponent=0).
-     * For input M * 3^E: rsqrt = rsqrt(M) * 3^(-E/2)
-     * LUT gives rsqrt(M), so add -E/2 to the exponent. */
+    y.exponent = RSQRT_LUT[idx].exp;
 
-    /* Newton-Raphson: y = y * (3 - x*y*y) / 2
-     * Constants: three = {1, 1} (exact: 1*3^1 = 3)
-     *            half  = {21523360, -16} (≈0.5, error 1.16e-8) */
-    static const mtfp21_t NR_THREE = {1, 1};
+    /* Apply exponent factor: need 1/sqrt(mant * 3^exp) = 1/sqrt(mant) * 3^(-exp/2) */
+    if (exp % 2 == 0) {
+        /* Even exponent: clean shift */
+        y.exponent += (-exp / 2);
+    } else {
+        /* Odd exponent: E = 2k + 1, k = (E-1)/2
+         * 3^(-E/2) = 3^(-k) * 3^(-1/2) = 3^(-k) / sqrt(3) */
+        static const mtfp21_t INV_SQRT3 = {8284027, -15};
+        int k = (exp - 1) / 2;
+        y.exponent += (-k);
+        y = mtfp21_mul(y, INV_SQRT3);
+    }
+
+    /* Newton-Raphson: y_new = y * (3 - x*y*y) / 2
+     * Constants computed without float:
+     *   three = 14348907 * 3^(-14) = 3^15 / 3^14 = 3 (exact, fully normalized)
+     *   half  = 21523360 * 3^(-16) ≈ 0.5 (error 1.16e-8)
+     * CRITICAL: three must be fully normalized ({14348907,-14} not {1,1})
+     * so that exponent alignment in the subtraction 3 - x*y^2 doesn't
+     * destroy precision. {1,1} has exp=1 while working values have exp~-15,
+     * causing 16 positions of alignment shift. */
+    static const mtfp21_t NR_THREE = {14348907, -14};
     static const mtfp21_t NR_HALF  = {21523360, -16};
 
     for (int i = 0; i < 2; i++) {
@@ -557,21 +570,80 @@ static inline void mtfp21_rmsnorm(
         sum_sq = mtfp21_add(sum_sq, xi2);
     }
 
-    /* Step 2: mean = sum / n */
-    mtfp21_t mean = mtfp21_from_float(mtfp21_to_float(sum_sq) / (float)n);
-    /* TODO: implement MTFP21 integer division for full integer path */
+    /* Step 2: mean = sum / n (integer division — no float) */
+    mtfp21_t mean = mtfp21_div_scalar(sum_sq, n);
 
     /* Step 3: add epsilon */
     mtfp21_t eps_m = mtfp21_from_float(eps);
     mtfp21_t mean_eps = mtfp21_add(mean, eps_m);
 
-    /* Step 4: rsqrt */
+    /* Step 4: rsqrt (integer-only LUT + NR) */
     mtfp21_t scale = mtfp21_rsqrt(mean_eps);
 
     /* Step 5: apply scale and convert back to float */
     float scale_f = mtfp21_to_float(scale);
     for (int i = 0; i < n; i++) {
         dst[i] = src[i] * scale_f;
+    }
+}
+
+/* ================================================================
+ *  Pure MTFP21 RMSNorm — zero float between input and output conversion
+ * ================================================================ */
+
+static inline void mtfp21_rmsnorm_pure(
+    mtfp21_t * restrict dst,
+    const mtfp21_t * restrict src,
+    int n,
+    mtfp21_t eps
+) {
+    /* Sum of squares */
+    mtfp21_t sum_sq = {0, 0};
+    for (int i = 0; i < n; i++) {
+        mtfp21_t xi2 = mtfp21_mul(src[i], src[i]);
+        sum_sq = mtfp21_add(sum_sq, xi2);
+    }
+
+    /* mean = sum / n */
+    mtfp21_t mean = mtfp21_div_scalar(sum_sq, n);
+
+    /* rsqrt(mean + eps) */
+    mtfp21_t mean_eps = mtfp21_add(mean, eps);
+    mtfp21_t scale = mtfp21_rsqrt(mean_eps);
+
+    /* Apply scale */
+    for (int i = 0; i < n; i++) {
+        dst[i] = mtfp21_mul(src[i], scale);
+    }
+}
+
+/* ================================================================
+ *  int8-to-int8 RMSNorm via MTFP21 — the actual pipeline operation
+ *
+ *  Input:  int8 activations (e.g. 5-trit range [-80, +80])
+ *  Output: int8 normalized activations (7-trit range for RMSNorm)
+ * ================================================================ */
+
+static inline void mtfp21_rmsnorm_int8(
+    int8_t * restrict dst,
+    const int8_t * restrict src,
+    int n,
+    mtfp21_t eps,
+    int out_range   /* output clamp range, e.g. 121 for 5-trit, 40 for 4-trit */
+) {
+    /* Convert int8 → MTFP21, compute RMSNorm, convert back to int8 */
+    /* Allocate MTFP21 temp buffers on stack (n * 5 bytes each) */
+    mtfp21_t *src_m = (mtfp21_t *)__builtin_alloca(n * sizeof(mtfp21_t));
+    mtfp21_t *dst_m = (mtfp21_t *)__builtin_alloca(n * sizeof(mtfp21_t));
+
+    for (int i = 0; i < n; i++) {
+        src_m[i] = mtfp21_from_int8(src[i]);
+    }
+
+    mtfp21_rmsnorm_pure(dst_m, src_m, n, eps);
+
+    for (int i = 0; i < n; i++) {
+        dst[i] = mtfp21_to_int8(dst_m[i], out_range);
     }
 }
 
