@@ -4192,7 +4192,9 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
-        ///*.padding      =*/ { 0 },
+        /*.shirley_i8   =*/ NULL,
+        /*.shirley_scale=*/ 0.0f,
+        /*.shirley_bridge=*/ 0,
     };
 
 #ifdef __clang__
