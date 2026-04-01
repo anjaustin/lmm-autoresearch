@@ -46,6 +46,37 @@
 #ifdef GGML_USE_LLAMAFILE
 #include <llamafile/sgemm.h>
 #endif
+#ifdef SHIRLEY_AVX2_RMSNORM
+/* Shirley AVX2 RMSNorm — inline the essential function to avoid include path issues.
+ * This is the core of shirley_rmsnorm_f32 from shirley_kernels.h. */
+#include <immintrin.h>
+static void shirley_rmsnorm_f32_inline(
+    float * restrict dst, const float * restrict src, int n, float eps
+) {
+    __m256 acc = _mm256_setzero_ps();
+    int i;
+    for (i = 0; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(src + i);
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(v, v));
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 sum4 = _mm_add_ps(lo, hi);
+    sum4 = _mm_hadd_ps(sum4, sum4);
+    sum4 = _mm_hadd_ps(sum4, sum4);
+    float sum_sq;
+    _mm_store_ss(&sum_sq, sum4);
+    for (; i < n; i++) sum_sq += src[i] * src[i];
+    float scale = 1.0f / sqrtf(sum_sq / (float)n + eps);
+    __m256 vscale = _mm256_set1_ps(scale);
+    for (i = 0; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(src + i);
+        _mm256_storeu_ps(dst + i, _mm256_mul_ps(v, vscale));
+    }
+    for (; i < n; i++) dst[i] = src[i] * scale;
+}
+#endif
+
 #if defined(GGML_BITNET_ARM_TL1) || defined(GGML_BITNET_X86_TL2)
 #include "ggml-bitnet.h"
 #endif
@@ -12114,12 +12145,18 @@ static void ggml_compute_forward_rms_norm_f32(
 
     GGML_ASSERT(eps > 0.0f);
 
-    // TODO: optimize
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
                 const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
 
+#ifdef SHIRLEY_AVX2_RMSNORM
+                /* Shirley AVX2 RMSNorm — drop-in replacement.
+                 * Same float32 in/out, no gamma (gamma is a separate ggml_mul).
+                 * Uses AVX2 vectorized sum-of-squares and scale. */
+                shirley_rmsnorm_f32_inline(y, x, (int)ne00, eps);
+#else
                 ggml_float sum = 0.0;
                 for (int64_t i00 = 0; i00 < ne00; i00++) {
                     sum += (ggml_float)(x[i00] * x[i00]);
@@ -12127,16 +12164,12 @@ static void ggml_compute_forward_rms_norm_f32(
 
                 const float mean = sum/ne00;
 
-                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
-
                 memcpy(y, x, ne00 * sizeof(float));
-                // for (int i00 = 0; i00 < ne00; i00++) {
-                //     y[i00] = x[i00];
-                // }
 
                 const float scale = 1.0f/sqrtf(mean + eps);
 
                 ggml_vec_scale_f32(ne00, y, scale);
+#endif
 
 #ifdef SHIRLEY_5TRIT_QUANT
                 // Quantize RMSNorm output to ternary precision
