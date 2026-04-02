@@ -8,6 +8,11 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
+/* Shirley: integer FFN custom op */
+#include "../../../shirley_ffn.h"
+static struct shirley_ffn_params * shirley_ffn_layer_params = nullptr;
+static int shirley_ffn_n_layers = 0;
+
 #if defined(GGML_USE_VULKAN)
 #  include "ggml-vulkan.h"
 #elif defined(GGML_USE_SYCL)
@@ -15393,6 +15398,25 @@ struct llm_build_context {
         // mutable variable, needed during the last layer of the computation to skip unused tokens
         int32_t n_tokens = this->n_tokens;
 
+        /* Shirley: initialize FFN params on first call */
+        if (!shirley_ffn_layer_params && n_layer > 0) {
+            shirley_ffn_n_layers = n_layer;
+            shirley_ffn_layer_params = (struct shirley_ffn_params *)calloc(
+                n_layer, sizeof(struct shirley_ffn_params));
+            float rms_eps = hparams.f_norm_rms_eps;
+            for (int il = 0; il < n_layer; il++) {
+                shirley_ffn_params_init(
+                    &shirley_ffn_layer_params[il],
+                    hparams.n_embd, hparams.n_ff(), rms_eps, il,
+                    model.layers[il].ffn_gate, model.layers[il].ffn_gate_scale,
+                    model.layers[il].ffn_up,   model.layers[il].ffn_up_scale,
+                    model.layers[il].ffn_down, model.layers[il].ffn_down_scale,
+                    model.layers[il].ffn_norm,
+                    model.layers[il].ffn_sub_norm
+                );
+            }
+        }
+
         const int64_t n_embd_head = hparams.n_embd_head_v;
         GGML_ASSERT(n_embd_head == hparams.n_embd_head_k);
         GGML_ASSERT(n_embd_head == hparams.n_rot);
@@ -15490,32 +15514,12 @@ struct llm_build_context {
             struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
             cb(ffn_inp, "ffn_inp", il);
 
-            cur = llm_build_norm(ctx0, ffn_inp, hparams,
-                    model.layers[il].ffn_norm, NULL,
-                    LLM_NORM_RMS, cb, il);
-            cb(cur, "ffn_norm", il);
-
-            cur = llm_build_ffn(ctx0, lctx, cur,
-                    model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_scale,
-                    model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_scale,
-                    NULL, NULL, NULL,
-                    NULL,
-                    LLM_FFN_RELU_SQR, LLM_FFN_PAR, cb, il);
-            cb(cur, "ffn_out", il);
-
-            cur = llm_build_norm(ctx0, cur, hparams,
-                            model.layers[il].ffn_sub_norm, NULL,
-                            LLM_NORM_RMS, cb, il);
-            cb(cur, "ffn_sub_norm", il);
-
-            cur = llm_build_lora_mm(lctx, ctx0, model.layers[il].ffn_down, cur);
-            /* Shirley: int8 output produced directly by Phase 1 bridge in ggml.c */
-            if (model.layers[il].ffn_down_scale) {
-                cur = ggml_mul(ctx0, cur, model.layers[il].ffn_down_scale);
-            }
-            cb(cur, "ffn_down", il);
-
-            cur = ggml_add(ctx0, cur, ffn_inp);
+            /* Shirley Phase 2: entire FFN as one custom op.
+             * Replaces: ffn_norm → gate/up matmuls → relu_sqr → mul →
+             * ffn_sub_norm → down matmul → scale → residual ADD */
+            cur = ggml_map_custom1(ctx0, ffn_inp,
+                shirley_ffn_compute, 1,
+                &shirley_ffn_layer_params[il]);
             cb(cur, "l_out", il);
 
             // input for next layer
