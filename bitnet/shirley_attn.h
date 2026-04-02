@@ -19,8 +19,12 @@ struct shirley_attn_params {
     int n_kv_head;      /* 5 */
     int head_dim;       /* 128 */
     int n_rot;          /* 128 (rotation dimensions) */
-    float eps;          /* RMSNorm epsilon */
-    float kq_scale;     /* 1/sqrt(head_dim) */
+    float eps;
+    int32_t eps_mant;   /* precomputed MTFP21 */
+    int8_t  eps_exp;
+    float kq_scale;     /* 1/sqrt(head_dim) — float for init */
+    int32_t kq_scale_mant;  /* precomputed MTFP21 */
+    int8_t  kq_scale_exp;
     int layer_idx;
 
     /* QKV + wo weight tensors (2-bit packed ternary) */

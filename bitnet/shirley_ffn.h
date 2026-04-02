@@ -16,6 +16,8 @@ struct shirley_ffn_params {
     int n_embd;
     int n_ff;
     float eps;
+    int32_t eps_mant;
+    int8_t  eps_exp;
     int layer_idx;
 
     const void * gate_data;

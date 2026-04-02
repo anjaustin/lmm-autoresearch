@@ -59,7 +59,7 @@ void shirley_output_compute(
             sum_sq = mtfp21_add(sum_sq, mtfp21_mul(inp_m[i], inp_m[i]));
         mtfp21_t mean = mtfp21_div_scalar(sum_sq, n);
         mtfp21_t scale = mtfp21_rsqrt(
-            mtfp21_add(mean, mtfp21_from_float(p->eps)));
+            mtfp21_add(mean, (mtfp21_t){p->eps_mant, p->eps_exp}));
 
         for (int i = 0; i < n; i++) {
             mtfp21_t normed = mtfp21_mul(inp_m[i], scale);
@@ -256,6 +256,7 @@ void shirley_output_params_init(
     p->n_embd = n_embd;
     p->vocab_size = vocab_size;
     p->eps = eps;
+    { mtfp21_t e = mtfp21_from_float(eps); p->eps_mant = e.mantissa; p->eps_exp = e.exponent; }
     shirley_convert_f32_to_mtfp21(
         &p->output_norm_gamma_mant, &p->output_norm_gamma_exp,
         output_norm ? (const float *)output_norm->data : NULL, n_embd);

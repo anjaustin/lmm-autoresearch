@@ -140,7 +140,7 @@ void shirley_attn_compute(
             for (int i = 0; i < n; i++)
                 sum_sq = mtfp21_add(sum_sq, mtfp21_mul(inp_m[i], inp_m[i]));
             mtfp21_t mean = mtfp21_div_scalar(sum_sq, n);
-            mtfp21_t scale = mtfp21_rsqrt(mtfp21_add(mean, mtfp21_from_float(p->eps)));
+            mtfp21_t scale = mtfp21_rsqrt(mtfp21_add(mean, (mtfp21_t){p->eps_mant, p->eps_exp}));
             for (int i = 0; i < n; i++) {
                 inp_m[i] = mtfp21_mul(inp_m[i], scale);
                 if (p->attn_norm_gamma_mant) {
@@ -208,7 +208,8 @@ void shirley_attn_compute(
                     mtfp21_t kval = {p->k_cache_mant[kidx], p->k_cache_exp[kidx]};
                     dot = mtfp21_add(dot, mtfp21_mul(qh[d], kval));
                 }
-                scores[t] = mtfp21_mul(dot, mtfp21_from_float(p->kq_scale));
+                mtfp21_t kqs = {p->kq_scale_mant, p->kq_scale_exp};
+                scores[t] = mtfp21_mul(dot, kqs);
             }
 
             shirley_softmax_mtfp21(scores, scores, kv_len);
@@ -231,7 +232,7 @@ void shirley_attn_compute(
             for (int i = 0; i < n; i++)
                 sum_sq = mtfp21_add(sum_sq, mtfp21_mul(attn_out[i], attn_out[i]));
             mtfp21_t mean = mtfp21_div_scalar(sum_sq, n);
-            mtfp21_t scale = mtfp21_rsqrt(mtfp21_add(mean, mtfp21_from_float(p->eps)));
+            mtfp21_t scale = mtfp21_rsqrt(mtfp21_add(mean, (mtfp21_t){p->eps_mant, p->eps_exp}));
 
             mtfp21_t normed[n]; /* VLA */
             for (int i = 0; i < n; i++) {
@@ -293,7 +294,9 @@ void shirley_attn_params_init(
     p->head_dim = head_dim;
     p->n_rot = head_dim;
     p->eps = eps;
+    { mtfp21_t e = mtfp21_from_float(eps); p->eps_mant = e.mantissa; p->eps_exp = e.exponent; }
     p->kq_scale = kq_scale;
+    { mtfp21_t kqs = mtfp21_from_float(kq_scale); p->kq_scale_mant = kqs.mantissa; p->kq_scale_exp = kqs.exponent; }
     p->layer_idx = layer_idx;
     p->rope_freq_base = rope_freq_base;
     p->max_seq_len = max_seq_len;

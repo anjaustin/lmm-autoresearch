@@ -87,13 +87,13 @@ static int8_t mtfp21_rmsnorm_to_mtfp16(
     int16_t * dst_mant,
     const mtfp21_t * src,
     const int32_t * gamma_mant, const int8_t * gamma_exp,
-    int n, float eps
+    int n, int32_t eps_mant, int8_t eps_exp
 ) {
     mtfp21_t sum_sq = {0, 0};
     for (int i = 0; i < n; i++)
         sum_sq = mtfp21_add(sum_sq, mtfp21_mul(src[i], src[i]));
     mtfp21_t mean = mtfp21_div_scalar(sum_sq, n);
-    mtfp21_t scale = mtfp21_rsqrt(mtfp21_add(mean, mtfp21_from_float(eps)));
+    mtfp21_t scale = mtfp21_rsqrt(mtfp21_add(mean, (mtfp21_t){eps_mant, eps_exp}));
 
     mtfp21_t normed[n]; /* VLA */
     for (int i = 0; i < n; i++) {
@@ -155,7 +155,7 @@ void shirley_ffn_compute(
         /* 1. RMSNorm → block-aligned MTFP16 for matmul (MTFP21 precision norm) */
         int16_t act_mant[n]; /* VLA — block-aligned mantissas */
         int8_t block_exp = mtfp21_rmsnorm_to_mtfp16(
-            act_mant, inp_m, p->ffn_norm_gamma_mant, p->ffn_norm_gamma_exp, n, p->eps);
+            act_mant, inp_m, p->ffn_norm_gamma_mant, p->ffn_norm_gamma_exp, n, p->eps_mant, p->eps_exp);
 
         /* 2. Gate matmul: MTFP16 × ternary → MTFP21 (pure integer, sign_epi16) */
         mtfp21_t gate_m[n_ff]; /* VLA */
@@ -176,7 +176,7 @@ void shirley_ffn_compute(
         /* 7. Sub-norm → block-aligned MTFP16 for down matmul */
         int16_t sub_mant[n_ff]; /* VLA */
         int8_t sub_exp = mtfp21_rmsnorm_to_mtfp16(
-            sub_mant, ffn_out, p->ffn_sub_norm_gamma_mant, p->ffn_sub_norm_gamma_exp, n_ff, p->eps);
+            sub_mant, ffn_out, p->ffn_sub_norm_gamma_mant, p->ffn_sub_norm_gamma_exp, n_ff, p->eps_mant, p->eps_exp);
 
         /* 8. Down matmul: MTFP16 × ternary → MTFP21 */
         mtfp21_t down_m[n]; /* VLA */
@@ -215,6 +215,7 @@ void shirley_ffn_params_init(
     p->n_embd = n_embd;
     p->n_ff = n_ff;
     p->eps = eps;
+    { mtfp21_t e = mtfp21_from_float(eps); p->eps_mant = e.mantissa; p->eps_exp = e.exponent; }
     p->layer_idx = layer_idx;
 
     p->gate_data = gate->data;

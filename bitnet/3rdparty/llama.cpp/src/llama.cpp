@@ -14,7 +14,7 @@
 #include "../../../shirley_output.h"
 static struct shirley_ffn_params * shirley_ffn_layer_params = nullptr;
 static struct shirley_attn_params * shirley_attn_layer_params = nullptr;
-static struct shirley_output_params shirley_output_p = {0, 0, 0.0f, nullptr, nullptr, nullptr, 0};
+static struct shirley_output_params shirley_output_p = {};
 static int shirley_ffn_n_layers = 0;
 
 #if defined(GGML_USE_VULKAN)

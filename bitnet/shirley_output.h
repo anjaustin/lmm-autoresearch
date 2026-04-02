@@ -18,6 +18,8 @@ struct shirley_output_params {
     int n_embd;
     int vocab_size;
     float eps;
+    int32_t eps_mant;
+    int8_t  eps_exp;
     int32_t * output_norm_gamma_mant;  /* [n_embd] — precomputed MTFP21 */
     int8_t  * output_norm_gamma_exp;
 
