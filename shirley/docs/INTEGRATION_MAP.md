@@ -363,40 +363,35 @@ O3: Sampling
 | Category | Count | Status | Remaining work |
 |----------|-------|--------|---------------|
 | Ternary matmul (sign_epi8) | 7 | **DONE** | 0 |
-| RMSNorm kernel (i8→i8) | 5 | **BUILT** | Wire into ggml dispatch |
-| Activation quantize | 4 | **ELIMINATED** | Remove when RMSNorm outputs int8 |
-| Post-matmul rescale (i32→i8) | 7 | **KERNEL BUILT** | Wire into ggml.c post-matmul code |
-| Scale factor fold-in | 4 | **DESIGN DONE** | Precompute MTFP21 at model load |
-| ReLU (i8) | 1 | **BUILT** | Wire into pipeline |
-| Square (i8→i16) | 1 | **BUILT** | Wire into pipeline |
-| Element-wise MUL (i16×i8→i8) | 1 | **BUILT** | Wire into pipeline |
-| Residual ADD (i8+i8→i8) | 2 | **BUILT** | Wire into pipeline |
+| Post-matmul rescale (i32→i8) | 7 | **INTEGRATED** | 0 (commit 843eef4) |
+| FFN block (MTFP21 custom op) | 1 | **INTEGRATED** | 0 (commit b0489e1) |
+| MTFP21 exp + softmax + cmp | 1 | **BUILT** | Wire into attention path |
 | RoPE (integer) | 2 | **NEEDS BUILDING** | Precompute sin/cos as Q15, build kernel |
 | Integer matmul (i8×i8→i32) | 3 | **NEEDS BUILDING** | Q@K^T, attn@V, LM head |
-| Softmax (iGPU EXP) | 2 | **NEEDS BUILDING** | MTFP21 exp, iGPU dispatch, orchestrator |
 | Embedding (i8) | 1 | **NEEDS BUILDING** | Quantize table at model load |
+| Attention custom op | 1 | **NEEDS BUILDING** | Same pattern as FFN custom op |
 
-**Total: 40 operations. 20 done/eliminated/built. 13 need wiring. 7 need new kernels.**
+**Total: 40 operations. FFN path complete. Attention path remaining.**
 
 ## The Critical Path
 
-### Phase 1: Post-matmul rescale — THE BRIDGE
+### Phase 1: Post-matmul rescale — COMPLETE
 
-Replace the float32 rescale `(raw / act_scale) * weight_scale` with `shirley_rescale_i32_to_i8` at all 4 post-matmul sites in ggml.c. The kernel is built. This is wiring.
+All 7 ternary matmuls write int8 via `shirley_rescale_raw_to_i8` at all 4 ggml.c code paths (16-row vec_dot, 1-row fallback, gemm, gemv). 5-trit activations (SHIRLEY_ACT_RANGE=80) validated: PPL 18.888, baseline 18.852.
 
-Combined_scale precomputed at model load as MTFP21, converted to Q15 for AVX2.
+Commits: bc23f57 (Option D validation), 843eef4 (Phase 1 integration).
 
-**This unblocks:** RMSNorm integration, activation quantize elimination, residual ADD, all FFN trivials.
+### Phase 2: FFN as unified MTFP21 custom op — COMPLETE
 
-**Scope:** wo, gate, up, down matmuls (4 of 7 ternary matmuls). The QKV matmuls also get this rescale, but their output additionally feeds into the attention integer path.
+The entire FFN block replaced with one `ggml_map_custom1` call to `shirley_ffn_compute`. Internally, every value is MTFP21 at 25.4-bit precision. The int8 appears ONLY at the matmul SIMD interface — a wire format, not a precision boundary.
 
-### Phase 2: RMSNorm + trivials wiring
+Operations fused: ffn_norm (MTFP21 RMSNorm) → gate/up matmuls (pack→sign_epi8→MTFP21) → ReLU (MTFP21) → square (MTFP21) → element-wise mul (MTFP21) → ffn_sub_norm (MTFP21 RMSNorm) → down matmul (pack→sign_epi8→MTFP21) → residual ADD (MTFP21).
 
-Wire `shirley_rmsnorm_ternary` into ggml dispatch for all 5 RMSNorm sites. Wire `shirley_relu_i8`, `shirley_square_i8_to_i16`, `shirley_mul_i16_i8_to_i8`, `shirley_residual_add_i16` into their respective ggml op dispatch points.
+PPL: 17.887 (5-chunk), baseline 17.873 — within noise.
 
-Precompute gamma weights as Q14 int16 at model load.
+Key insight: int8 quantization between every op lost 1+ PPL. MTFP21 intermediates: zero PPL loss. The matmul wire format is not a precision decision.
 
-**This completes:** The FFN block end-to-end in integer. Data flows i8 through the entire FFN without leaving the integer domain.
+Commits: 75e24d8 (scaffold), 937fe7f (gemv fix + batch), b0489e1 (MTFP21 rewrite).
 
 ### Phase 3: Integer RoPE
 
@@ -412,7 +407,9 @@ Build `shirley_matmul_i8_i8()` for Q@K^T and attn@V. Standard int8×int8→int32
 
 ### Phase 5: Softmax — the EXP prime
 
-Build MTFP21 exp() via LUT + polynomial correction (same architecture as rsqrt). Initial implementation on CPU. Then build iGPU dispatch via shared memory for V_EXP_F32.
+MTFP21 exp() is BUILT (commit 6bb5ccb): LUT + linear interpolation, 256 entries, max error 9.5e-6. MTFP21 softmax is BUILT: subtract max → exp → sum → normalize → quantize. 109/109 tests pass.
+
+Remaining: wire into the attention custom op (same pattern as FFN — one function, MTFP21 throughout). CPU fallback first, iGPU dispatch (V_EXP_F32) is an optimization.
 
 **This completes:** The attention mechanism end-to-end without float32.
 

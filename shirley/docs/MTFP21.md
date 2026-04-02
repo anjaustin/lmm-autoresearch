@@ -227,12 +227,15 @@ The precision threshold: can a frozen shape approximate `exp(x)` and `log(x)` to
 
 ## Implementation Status
 
-MTFP21 is **fully implemented and validated** in `bitnet/shirley_mtfp21.h` (102/102 tests pass):
+MTFP21 is **fully implemented and validated** in `bitnet/shirley_mtfp21.h` (109/109 tests pass):
 
 - Conversion: float32 ↔ MTFP21, int8 ↔ MTFP21 (exact round-trip for all trit ranges)
 - Arithmetic: add (with exponent alignment), multiply (single-shot normalization), negate, abs
 - Division: integer reciprocal multiply (no float), scalar and general variants
 - rsqrt: 256-entry precomputed LUT + 2 Newton-Raphson iterations, zero float ops, max error 8.94e-08
+- **exp(x):** 256-entry LUT + linear interpolation. Range reduction via x = k×ln(3) + r exploits MTFP21's base-3 exponent — 3^k is a free exponent shift. Max error 9.50e-06 across softmax range [-30, 0]. Handles exp(70) ≈ 2.5e30 correctly. (commit 6bb5ccb)
+- **softmax:** Full MTFP21: subtract max (MAX prime) → exp (EXP prime) → sum (ADD prime) → normalize via reciprocal (MUL prime) → quantize to int8. Conservation validated (sum ≈ out_range). (commit 6bb5ccb)
+- **cmp(a, b):** Integer comparison without float conversion. Returns -1/0/+1. Used for softmax max-finding. (commit 6bb5ccb)
 - RMSNorm: pure MTFP21 path (zero float between conversion boundaries), 100% exact match vs float64
 - Accumulation: statistically better than float32 (wins 57.2% of 1000 head-to-head comparisons)
 - Adversarial: passes all 6 distributions (heavy tails, near-zero, bimodal, cancellation, dynamic range, all-same)
@@ -241,21 +244,25 @@ MTFP21 is **fully implemented and validated** in `bitnet/shirley_mtfp21.h` (102/
 
 The original spec described multiply as `sign_epi8(a.mantissa, b.mantissa)` — element-wise trit multiplication. This is only correct when one operand is a single ternary weight {-1, 0, +1} (the matmul case). General MTFP21 × MTFP21 uses int32 mantissa multiplication in int64 with single-shot normalization. The implementation uses the correct general algorithm.
 
-## Architectural Role: Transport, Not Compute
+## Architectural Role
 
-MTFP21 was originally designed as a universal compute format — the per-element arithmetic for all operations. **Profiling showed this is 142,000 ns per RMSNorm (n=2560), 65x slower than float32.** The overhead comes from per-element normalization (iterative divide-by-3 loops, exponent alignment) that the hardware doesn't accelerate.
+MTFP21 serves two roles in the Shirley pipeline:
 
-The correct architecture separates representation from compute:
+**1. Full-precision compute between matmuls.** The FFN block (commit b0489e1) runs every intermediate value — gate output, up output, ReLU, square, element-wise multiply — in MTFP21 at 25.4-bit precision. No quantization between operations. The per-element MTFP21 arithmetic (scalar int64 loops) is slower than AVX2 (~7 tok/s vs ~22 tok/s) but preserves precision: PPL matches baseline within noise, while int8 intermediates lost 1+ PPL.
+
+**2. Scale factor bookkeeping.** Every int8 tensor at the matmul interface carries an MTFP21 scale. Every matmul rescale computes `weight_scale × layer_scale / act_scale` in MTFP21. These are scalar operations — the overhead is negligible.
+
+The performance gap (scalar MTFP21 vs AVX2 vectorized) is an optimization target, not an architectural problem. The math is correct at full precision. AVX2 vectorization of MTFP21 operations (int32 mantissa in SIMD lanes, exponent tracking) is future work.
 
 ```
-Layer 1: AVX2 integer kernels    Per-element bulk work (sign_epi8, mullo, mulhrs)
-         417 ns per RMSNorm      32 elements/cycle, native hardware
+Layer 1: AVX2 integer kernels    Matmul inner loop (sign_epi8, maddubs)
+         Ternary dot product     32 elements/cycle, native hardware
 
-Layer 2: Scalar arithmetic       One-off computations (rsqrt, division)
-         FPU (5 ns) or MTFP21 LUT+NR (200 ns) or iGPU
+Layer 2: MTFP21 per-element      Between-matmul operations (ReLU, sqr, mul, norm)
+         Full precision          25.4 bits, no quantization boundaries
 
-Layer 3: MTFP21 transport        Scale factors, normalization parameters, metadata
-         25.4-bit precision      Values computed once, applied many times
+Layer 3: MTFP21 scalar           Scale factors, rsqrt, exp (one-off per call)
+         LUT + Newton-Raphson    Integer-only transcendentals
 ```
 
 MTFP21 sits at Layer 3. It stores the scalar results of Layer 2 computations (rsqrt values, reciprocals, scale factors) and transports them between Layer 1 compute stages. It does NOT perform the per-element squaring, accumulation, or scaling — those use raw AVX2 integer at Layer 1.

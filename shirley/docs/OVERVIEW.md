@@ -131,14 +131,23 @@ The end-to-end ternary kernel (`shirley_rmsnorm_ternary`) is **faster than the f
 
 **MTFP21 validation (shirley_mtfp21.h):**
 
-102/102 tests pass. Integer-only arithmetic that exceeds float32 precision:
+109/109 tests pass. Integer-only arithmetic that exceeds float32 precision:
 - Accumulation: MTFP21 wins 57.2% of 1000 head-to-head comparisons vs float32
 - rsqrt: 256-entry LUT + 2 Newton-Raphson iterations, max error 8.94e-08, zero float
+- exp(x): 256-entry LUT + linear interpolation, max error 9.50e-06, handles full softmax range [-30, 0]
+- softmax: full MTFP21 (subtract max → exp → sum → normalize), conservation validated
+- cmp: integer comparison without float conversion
 - RMSNorm: 100% exact match against float64 reference through full int8→MTFP21→int8 pipeline
 
-MTFP21 is validated as a number system but too slow for per-element compute (scalar int64 loops). Its role: transport format between compute stages, iGPU interface, and proof that integer-only inference arithmetic works at full precision.
+**Pipeline integration (2026-04-01):**
 
-Full results: `BITNET_TERNARY_PLAN.md`. Journals: `../bitnet/journal/`, `../journal/`. Kernel code: `../bitnet/shirley_kernels.h`.
+- **Phase 1 COMPLETE:** All 7 ternary matmuls per layer write int8 via `shirley_rescale_raw_to_i8`. 5-trit activations validated (PPL 18.888, baseline 18.852).
+- **Phase 2 COMPLETE:** Entire FFN block runs as one custom op (`shirley_ffn.cpp`), fully MTFP21 internally. Every intermediate (gate, up, ReLU, square, mul) is MTFP21 at 25.4-bit precision. Int8 appears ONLY at the matmul SIMD wire interface. PPL: 17.887, baseline 17.873 — within noise.
+- **Phases 3-6 PENDING:** Integer RoPE, integer attention matmuls, MTFP21 softmax integration, embedding/LM head. The attention block still uses ggml's float32 path.
+
+Key finding: int8 quantization between every op lost 1+ PPL. MTFP21 intermediates: zero PPL loss. The precision lives in the number system, not the wire format.
+
+Full results: `BITNET_TERNARY_PLAN.md`. Kernel code: `../bitnet/shirley_kernels.h`, `../bitnet/shirley_mtfp21.h`, `../bitnet/shirley_ffn.cpp`.
 
 ## Research Questions
 
