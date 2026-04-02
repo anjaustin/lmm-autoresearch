@@ -273,9 +273,41 @@ void shirley_attn_compute(
             }
         }
 
-        /* 7. Convert MTFP21 attention output to float for ggml */
-        for (int i = 0; i < n; i++) {
-            out_tok[i] = mtfp21_to_float(attn_out[i]);
+        /* 7. attn_sub_norm: MTFP21 RMSNorm → pack for wo matmul */
+        {
+            /* RMSNorm on attention output */
+            mtfp21_t sum_sq = {0, 0};
+            for (int i = 0; i < n; i++)
+                sum_sq = mtfp21_add(sum_sq, mtfp21_mul(attn_out[i], attn_out[i]));
+            mtfp21_t mean = mtfp21_div_scalar(sum_sq, n);
+            mtfp21_t scale = mtfp21_rsqrt(
+                mtfp21_add(mean, mtfp21_from_float(p->eps)));
+
+            mtfp21_t normed[n]; /* VLA */
+            for (int i = 0; i < n; i++) {
+                normed[i] = mtfp21_mul(attn_out[i], scale);
+                if (p->sub_norm_gamma) {
+                    normed[i] = mtfp21_mul(normed[i],
+                        mtfp21_from_float(p->sub_norm_gamma[i]));
+                }
+            }
+
+            /* 8. wo matmul: pack → ternary matmul → MTFP21 */
+            int8_t wo_act[n]; /* VLA */
+            float wo_act_scale = mtfp21_pack_for_matmul_attn(wo_act, normed, n, 80);
+
+            float wo_raw[n]; /* VLA */
+            ggml_gemv_i2_i8_s(n, wo_raw, n, p->wo_data, wo_act, 1, n);
+
+            /* 9. Rescale with wo_wscale * wo_lscale, output as MTFP21 */
+            mtfp21_t wo_out[n]; /* VLA */
+            matmul_raw_to_mtfp21_attn(wo_out, wo_raw, n,
+                wo_act_scale, p->wo_wscale * p->wo_lscale);
+
+            /* 10. Convert to float for ggml output (residual add is next) */
+            for (int i = 0; i < n; i++) {
+                out_tok[i] = mtfp21_to_float(wo_out[i]);
+            }
         }
     }
 
@@ -303,7 +335,10 @@ void shirley_attn_params_init(
     float rope_freq_base,
     const struct ggml_tensor * wq,
     const struct ggml_tensor * wk,
-    const struct ggml_tensor * wv
+    const struct ggml_tensor * wv,
+    const struct ggml_tensor * wo,
+    const struct ggml_tensor * wo_scale_t,
+    const struct ggml_tensor * attn_sub_norm
 ) {
     p->n_embd = n_embd;
     p->n_head = n_head;
@@ -320,11 +355,15 @@ void shirley_attn_params_init(
     p->wq_data = wq->data;
     p->wk_data = wk->data;
     p->wv_data = wv->data;
+    p->wo_data = wo->data;
 
     /* Weight scales */
     p->wq_wscale = *(const float *)((const uint8_t *)wq->data + (wq->ne[0] * wq->ne[1] / 4));
     p->wk_wscale = *(const float *)((const uint8_t *)wk->data + (wk->ne[0] * wk->ne[1] / 4));
     p->wv_wscale = *(const float *)((const uint8_t *)wv->data + (wv->ne[0] * wv->ne[1] / 4));
+    p->wo_wscale = *(const float *)((const uint8_t *)wo->data + (wo->ne[0] * wo->ne[1] / 4));
+    p->wo_lscale = wo_scale_t ? *(const float *)wo_scale_t->data : 1.0f;
+    p->sub_norm_gamma = attn_sub_norm ? (const float *)attn_sub_norm->data : NULL;
 
     /* Precompute RoPE sin/cos tables — CONST prime values.
      * These are computed ONCE at model load. No runtime transcendentals.

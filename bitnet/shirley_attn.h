@@ -23,17 +23,23 @@ struct shirley_attn_params {
     float kq_scale;     /* 1/sqrt(head_dim) */
     int layer_idx;
 
-    /* QKV weight tensors (2-bit packed ternary) */
+    /* QKV + wo weight tensors (2-bit packed ternary) */
     const void * wq_data;
     const void * wk_data;
     const void * wv_data;
+    const void * wo_data;
 
     /* Weight scales */
     float wq_wscale;
     float wk_wscale;
     float wv_wscale;
+    float wo_wscale;
 
-    /* Per-layer learned scales (1.0 if absent) — not used for QKV in BitNet */
+    /* Per-layer learned scales */
+    float wo_lscale;       /* wo_scale, 1.0 if absent */
+
+    /* attn_sub_norm gamma (float, for now) */
+    const float * sub_norm_gamma;  /* [n_embd] */
 
     /* RoPE sin/cos tables — precomputed MTFP21, stored as float pairs.
      * Layout: [max_seq_len][head_dim/2] for both sin and cos.
@@ -81,7 +87,10 @@ void shirley_attn_params_init(
     float rope_freq_base,
     const struct ggml_tensor * wq,
     const struct ggml_tensor * wk,
-    const struct ggml_tensor * wv);
+    const struct ggml_tensor * wv,
+    const struct ggml_tensor * wo,
+    const struct ggml_tensor * wo_scale_t,
+    const struct ggml_tensor * attn_sub_norm);
 
 #ifdef __cplusplus
 }

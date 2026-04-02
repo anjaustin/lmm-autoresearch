@@ -15434,7 +15434,10 @@ struct llm_build_context {
                     hparams.rope_freq_base_train,
                     model.layers[il].wq,
                     model.layers[il].wk,
-                    model.layers[il].wv
+                    model.layers[il].wv,
+                    model.layers[il].wo,
+                    model.layers[il].wo_scale,
+                    model.layers[il].attn_sub_norm
                 );
             }
         }
@@ -15461,28 +15464,11 @@ struct llm_build_context {
             cb(cur, "attn_norm", il);
 
             // self-attention — Shirley MTFP21 custom op
+            // Includes: QKV matmuls + RoPE + Q@K^T + softmax + attn@V + sub_norm + wo + scale
             {
-                /* Shirley Phase 3-5: QKV matmuls + RoPE + Q@K^T + softmax + attn@V
-                 * All in MTFP21. RoPE uses precomputed CONST sin/cos tables.
-                 * Softmax uses mtfp21_exp (the EXP prime). */
                 cur = ggml_map_custom1(ctx0, cur,
                     shirley_attn_compute, 1,
                     &shirley_attn_layer_params[il]);
-                cb(cur, "shirley_attn", il);
-
-                cur = llm_build_norm(ctx0, cur, hparams,
-                        model.layers[il].attn_sub_norm, NULL,
-                        LLM_NORM_RMS, cb, il);
-                cb(cur, "attn_sub_norm", il);
-
-                cur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wo, cur);
-                /* Shirley: int8 output produced directly by Phase 1 bridge in ggml.c */
-                if (model.layers[il].wo_scale) {
-                    cur = ggml_mul(ctx0, cur, model.layers[il].wo_scale);
-                }
-                if (model.layers[il].bo) {
-                    cur = ggml_add(ctx0, cur, model.layers[il].bo);
-                }
                 cb(cur, "attn_o_out", il);
             }
 
