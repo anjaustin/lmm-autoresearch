@@ -8,11 +8,13 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
-/* Shirley: integer FFN and attention custom ops */
+/* Shirley: MTFP21 custom ops for attention, FFN, and output */
 #include "../../../shirley_ffn.h"
 #include "../../../shirley_attn.h"
+#include "../../../shirley_output.h"
 static struct shirley_ffn_params * shirley_ffn_layer_params = nullptr;
 static struct shirley_attn_params * shirley_attn_layer_params = nullptr;
+static struct shirley_output_params shirley_output_p = {0, 0, nullptr, 0};
 static int shirley_ffn_n_layers = 0;
 
 #if defined(GGML_USE_VULKAN)
@@ -15441,6 +15443,11 @@ struct llm_build_context {
                     model.layers[il].attn_sub_norm
                 );
             }
+
+            if (!shirley_output_p.ready) {
+                shirley_output_params_init(&shirley_output_p,
+                    hparams.n_embd, rms_eps, model.output_norm);
+            }
         }
 
         const int64_t n_embd_head = hparams.n_embd_head_v;
@@ -15481,12 +15488,12 @@ struct llm_build_context {
 
         cur = inpL;
 
-        cur = llm_build_norm(ctx0, cur, hparams,
-                model.output_norm, NULL,
-                LLM_NORM_RMS, cb, -1);
+        // Output norm — Shirley MTFP21 RMSNorm
+        cur = ggml_map_custom1(ctx0, cur,
+            shirley_output_compute, 1, &shirley_output_p);
         cb(cur, "result_norm", -1);
 
-        // lm_head
+        // lm_head — float32 matmul with tied embedding weights (model boundary)
         cur = llm_build_lora_mm(lctx, ctx0, model.tok_embd, cur);
 
         cb(cur, "result_output", -1);
