@@ -30,8 +30,11 @@ struct shirley_ffn_params {
     float up_lscale;
     float down_lscale;
 
-    const float * ffn_norm_gamma;
-    const float * ffn_sub_norm_gamma;
+    /* Gamma weights — precomputed as MTFP21 at model load */
+    int32_t * ffn_norm_gamma_mant;
+    int8_t  * ffn_norm_gamma_exp;
+    int32_t * ffn_sub_norm_gamma_mant;
+    int8_t  * ffn_sub_norm_gamma_exp;
 
     int8_t  * w_act;
     int8_t  * w_gate;

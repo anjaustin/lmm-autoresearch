@@ -18,7 +18,8 @@ struct shirley_output_params {
     int n_embd;
     int vocab_size;
     float eps;
-    const float * output_norm_gamma;  /* [n_embd] */
+    int32_t * output_norm_gamma_mant;  /* [n_embd] — precomputed MTFP21 */
+    int8_t  * output_norm_gamma_exp;
 
     /* Embedding table converted to MTFP21 at model load.
      * Layout: [vocab_size][n_embd] as mtfp21_t structs.

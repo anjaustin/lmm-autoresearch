@@ -16,6 +16,8 @@
 #define restrict
 #include "shirley_kernels.h"
 
+#include "shirley_convert.h"
+
 #include "3rdparty/llama.cpp/ggml/include/ggml.h"
 #include "shirley_output.h"
 
@@ -61,9 +63,9 @@ void shirley_output_compute(
 
         for (int i = 0; i < n; i++) {
             mtfp21_t normed = mtfp21_mul(inp_m[i], scale);
-            if (p->output_norm_gamma) {
-                normed = mtfp21_mul(normed,
-                    mtfp21_from_float(p->output_norm_gamma[i]));
+            if (p->output_norm_gamma_mant) {
+                mtfp21_t g = {p->output_norm_gamma_mant[i], p->output_norm_gamma_exp[i]};
+                normed = mtfp21_mul(normed, g);
             }
             out_tok[i] = mtfp21_to_float(normed);
         }
@@ -254,7 +256,9 @@ void shirley_output_params_init(
     p->n_embd = n_embd;
     p->vocab_size = vocab_size;
     p->eps = eps;
-    p->output_norm_gamma = output_norm ? (const float *)output_norm->data : NULL;
+    shirley_convert_f32_to_mtfp21(
+        &p->output_norm_gamma_mant, &p->output_norm_gamma_exp,
+        output_norm ? (const float *)output_norm->data : NULL, n_embd);
 
     /* Store the embedding tensor pointer for lazy conversion.
      * The actual data may not be loaded yet at init time —

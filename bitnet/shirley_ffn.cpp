@@ -18,6 +18,8 @@
 #include "shirley_kernels.h"
 #include "shirley_mtfp16_matmul.h"
 
+#include "shirley_convert.h"
+
 #include "3rdparty/llama.cpp/ggml/include/ggml.h"
 #include "shirley_ffn.h"
 
@@ -84,7 +86,7 @@ static int8_t mtfp16_block_align(
 static int8_t mtfp21_rmsnorm_to_mtfp16(
     int16_t * dst_mant,
     const mtfp21_t * src,
-    const float * gamma,
+    const int32_t * gamma_mant, const int8_t * gamma_exp,
     int n, float eps
 ) {
     mtfp21_t sum_sq = {0, 0};
@@ -96,8 +98,10 @@ static int8_t mtfp21_rmsnorm_to_mtfp16(
     mtfp21_t normed[n]; /* VLA */
     for (int i = 0; i < n; i++) {
         normed[i] = mtfp21_mul(src[i], scale);
-        if (gamma)
-            normed[i] = mtfp21_mul(normed[i], mtfp21_from_float(gamma[i]));
+        if (gamma_mant) {
+            mtfp21_t g = {gamma_mant[i], gamma_exp[i]};
+            normed[i] = mtfp21_mul(normed[i], g);
+        }
     }
 
     return mtfp16_block_align(dst_mant, normed, n);
@@ -151,7 +155,7 @@ void shirley_ffn_compute(
         /* 1. RMSNorm → block-aligned MTFP16 for matmul (MTFP21 precision norm) */
         int16_t act_mant[n]; /* VLA — block-aligned mantissas */
         int8_t block_exp = mtfp21_rmsnorm_to_mtfp16(
-            act_mant, inp_m, p->ffn_norm_gamma, n, p->eps);
+            act_mant, inp_m, p->ffn_norm_gamma_mant, p->ffn_norm_gamma_exp, n, p->eps);
 
         /* 2. Gate matmul: MTFP16 × ternary → MTFP21 (pure integer, sign_epi16) */
         mtfp21_t gate_m[n_ff]; /* VLA */
@@ -172,7 +176,7 @@ void shirley_ffn_compute(
         /* 7. Sub-norm → block-aligned MTFP16 for down matmul */
         int16_t sub_mant[n_ff]; /* VLA */
         int8_t sub_exp = mtfp21_rmsnorm_to_mtfp16(
-            sub_mant, ffn_out, p->ffn_sub_norm_gamma, n_ff, p->eps);
+            sub_mant, ffn_out, p->ffn_sub_norm_gamma_mant, p->ffn_sub_norm_gamma_exp, n_ff, p->eps);
 
         /* 8. Down matmul: MTFP16 × ternary → MTFP21 */
         mtfp21_t down_m[n]; /* VLA */
@@ -225,8 +229,12 @@ void shirley_ffn_params_init(
     p->up_lscale = up_scale_t ? *(const float *)up_scale_t->data : 1.0f;
     p->down_lscale = down_scale_t ? *(const float *)down_scale_t->data : 1.0f;
 
-    p->ffn_norm_gamma = ffn_norm ? (const float *)ffn_norm->data : NULL;
-    p->ffn_sub_norm_gamma = ffn_sub_norm ? (const float *)ffn_sub_norm->data : NULL;
+    shirley_convert_f32_to_mtfp21(
+        &p->ffn_norm_gamma_mant, &p->ffn_norm_gamma_exp,
+        ffn_norm ? (const float *)ffn_norm->data : NULL, n_embd);
+    shirley_convert_f32_to_mtfp21(
+        &p->ffn_sub_norm_gamma_mant, &p->ffn_sub_norm_gamma_exp,
+        ffn_sub_norm ? (const float *)ffn_sub_norm->data : NULL, n_ff);
 
     int max_dim = n_embd > n_ff ? n_embd : n_ff;
     p->w_act     = (int8_t  *)malloc(max_dim * sizeof(int8_t));

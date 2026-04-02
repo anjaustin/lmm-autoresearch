@@ -17,6 +17,8 @@
 #include "shirley_kernels.h"
 #include "shirley_mtfp16_matmul.h"
 
+#include "shirley_convert.h"
+
 #include "3rdparty/llama.cpp/ggml/include/ggml.h"
 #include "shirley_attn.h"
 
@@ -141,8 +143,10 @@ void shirley_attn_compute(
             mtfp21_t scale = mtfp21_rsqrt(mtfp21_add(mean, mtfp21_from_float(p->eps)));
             for (int i = 0; i < n; i++) {
                 inp_m[i] = mtfp21_mul(inp_m[i], scale);
-                if (p->attn_norm_gamma)
-                    inp_m[i] = mtfp21_mul(inp_m[i], mtfp21_from_float(p->attn_norm_gamma[i]));
+                if (p->attn_norm_gamma_mant) {
+                    mtfp21_t g = {p->attn_norm_gamma_mant[i], p->attn_norm_gamma_exp[i]};
+                    inp_m[i] = mtfp21_mul(inp_m[i], g);
+                }
             }
         }
 
@@ -232,8 +236,10 @@ void shirley_attn_compute(
             mtfp21_t normed[n]; /* VLA */
             for (int i = 0; i < n; i++) {
                 normed[i] = mtfp21_mul(attn_out[i], scale);
-                if (p->sub_norm_gamma)
-                    normed[i] = mtfp21_mul(normed[i], mtfp21_from_float(p->sub_norm_gamma[i]));
+                if (p->sub_norm_gamma_mant) {
+                    mtfp21_t g = {p->sub_norm_gamma_mant[i], p->sub_norm_gamma_exp[i]};
+                    normed[i] = mtfp21_mul(normed[i], g);
+                }
             }
 
             /* wo matmul: MTFP16 × ternary → MTFP21 */
@@ -302,8 +308,12 @@ void shirley_attn_params_init(
     p->wv_wscale = *(const float *)((const uint8_t *)wv->data + (wv->ne[0] * wv->ne[1] / 4));
     p->wo_wscale = *(const float *)((const uint8_t *)wo->data + (wo->ne[0] * wo->ne[1] / 4));
     p->wo_lscale = wo_scale_t ? *(const float *)wo_scale_t->data : 1.0f;
-    p->attn_norm_gamma = attn_norm ? (const float *)attn_norm->data : NULL;
-    p->sub_norm_gamma = attn_sub_norm ? (const float *)attn_sub_norm->data : NULL;
+    shirley_convert_f32_to_mtfp21(
+        &p->attn_norm_gamma_mant, &p->attn_norm_gamma_exp,
+        attn_norm ? (const float *)attn_norm->data : NULL, n_embd);
+    shirley_convert_f32_to_mtfp21(
+        &p->sub_norm_gamma_mant, &p->sub_norm_gamma_exp,
+        attn_sub_norm ? (const float *)attn_sub_norm->data : NULL, n_embd);
 
     /* RoPE sin/cos tables — precomputed as MTFP21 (CONST prime).
      * Transcendentals consumed at load time. Zero float at runtime. */

@@ -38,9 +38,11 @@ struct shirley_attn_params {
     /* Per-layer learned scales */
     float wo_lscale;       /* wo_scale, 1.0 if absent */
 
-    /* Norm gammas (float, for now) */
-    const float * attn_norm_gamma;  /* [n_embd] — input norm */
-    const float * sub_norm_gamma;   /* [n_embd] — post-attention norm */
+    /* Norm gammas — precomputed as MTFP21 at model load */
+    int32_t * attn_norm_gamma_mant;
+    int8_t  * attn_norm_gamma_exp;
+    int32_t * sub_norm_gamma_mant;
+    int8_t  * sub_norm_gamma_exp;
 
     /* RoPE sin/cos tables — precomputed as MTFP21 (CONST prime).
      * Layout: [max_seq_len][head_dim/2] pairs.
