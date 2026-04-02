@@ -15456,32 +15456,21 @@ struct llm_build_context {
          * kv_pos tracks position across calls — NOT reset here. */
 
         for (int il = 0; il < n_layer; ++il) {
-            struct ggml_tensor * inpSA = inpL;
 
             // self-attention — Shirley MTFP21 custom op
-            // Includes: attn_norm + QKV matmuls + RoPE + Q@K^T + softmax + attn@V + sub_norm + wo + scale
-            {
-                cur = ggml_map_custom1(ctx0, inpL,
-                    shirley_attn_compute, 1,
-                    &shirley_attn_layer_params[il]);
-                cb(cur, "attn_o_out", il);
-            }
+            // Includes: attn_norm + QKV + RoPE + attention + sub_norm + wo + scale + RESIDUAL ADD
+            cur = ggml_map_custom1(ctx0, inpL,
+                shirley_attn_compute, 1,
+                &shirley_attn_layer_params[il]);
+            cb(cur, "ffn_inp", il);
 
             if (il == n_layer - 1) {
-                // skip computing output for unused tokens
                 struct ggml_tensor * inp_out_ids = build_inp_out_ids();
-                // n_tokens = n_outputs;
-                cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
-                inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+                cur = ggml_get_rows(ctx0, cur, inp_out_ids);
             }
 
-            struct ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
-            cb(ffn_inp, "ffn_inp", il);
-
-            /* Shirley Phase 2: entire FFN as one custom op.
-             * Replaces: ffn_norm → gate/up matmuls → relu_sqr → mul →
-             * ffn_sub_norm → down matmul → scale → residual ADD */
-            cur = ggml_map_custom1(ctx0, ffn_inp,
+            /* Shirley FFN custom op — includes residual ADD */
+            cur = ggml_map_custom1(ctx0, cur,
                 shirley_ffn_compute, 1,
                 &shirley_ffn_layer_params[il]);
             cb(cur, "l_out", il);

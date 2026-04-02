@@ -321,9 +321,11 @@ void shirley_attn_compute(
             matmul_raw_to_mtfp21_attn(wo_out, wo_raw, n,
                 wo_act_scale, p->wo_wscale * p->wo_lscale);
 
-            /* 10. Convert to float for ggml output (residual add is next) */
+            /* 10. Residual ADD + convert to float.
+             * Add wo output to the ORIGINAL input (pre-norm) for the skip connection. */
             for (int i = 0; i < n; i++) {
-                out_tok[i] = mtfp21_to_float(wo_out[i]);
+                mtfp21_t residual = mtfp21_from_float(input[i]);
+                out_tok[i] = mtfp21_to_float(mtfp21_add(wo_out[i], residual));
             }
         }
     }
