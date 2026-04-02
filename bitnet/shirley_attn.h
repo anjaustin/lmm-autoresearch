@@ -42,18 +42,23 @@ struct shirley_attn_params {
     const float * attn_norm_gamma;  /* [n_embd] — input norm */
     const float * sub_norm_gamma;   /* [n_embd] — post-attention norm */
 
-    /* RoPE sin/cos tables — precomputed MTFP21, stored as float pairs.
-     * Layout: [max_seq_len][head_dim/2] for both sin and cos.
-     * Indexed by position. */
-    float * rope_cos;    /* [max_seq_len * head_dim/2] */
-    float * rope_sin;    /* [max_seq_len * head_dim/2] */
+    /* RoPE sin/cos tables — precomputed as MTFP21 (CONST prime).
+     * Layout: [max_seq_len][head_dim/2] pairs.
+     * Mantissa and exponent stored in parallel arrays for cache efficiency. */
+    int32_t * rope_cos_mant;  /* [max_seq_len * head_dim/2] */
+    int8_t  * rope_cos_exp;   /* [max_seq_len * head_dim/2] */
+    int32_t * rope_sin_mant;  /* [max_seq_len * head_dim/2] */
+    int8_t  * rope_sin_exp;   /* [max_seq_len * head_dim/2] */
     int max_seq_len;
     float rope_freq_base;
 
-    /* KV cache — MTFP21 values stored as float for now.
+    /* KV cache — native MTFP21. Each entry is a position in the geometric space.
+     * Mantissa and exponent stored in parallel arrays.
      * Layout: [max_seq_len][n_kv_head * head_dim] */
-    float * k_cache;     /* [max_seq_len * n_kv_head * head_dim] */
-    float * v_cache;     /* [max_seq_len * n_kv_head * head_dim] */
+    int32_t * k_cache_mant;   /* mantissas */
+    int8_t  * k_cache_exp;    /* exponents */
+    int32_t * v_cache_mant;
+    int8_t  * v_cache_exp;
     int kv_pos;          /* current write position in cache */
     int kv_len;          /* total valid entries in cache */
 

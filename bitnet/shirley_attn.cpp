@@ -67,12 +67,14 @@ static int8_t mtfp16_block_align_attn(
 
 static void shirley_rope_mtfp21(
     mtfp21_t * dst, const mtfp21_t * src,
-    const float * cos_table, const float * sin_table, int head_dim
+    const int32_t * cos_mant, const int8_t * cos_exp,
+    const int32_t * sin_mant, const int8_t * sin_exp,
+    int head_dim
 ) {
     int half = head_dim / 2;
     for (int i = 0; i < half; i++) {
-        mtfp21_t cos_v = mtfp21_from_float(cos_table[i]);
-        mtfp21_t sin_v = mtfp21_from_float(sin_table[i]);
+        mtfp21_t cos_v = {cos_mant[i], cos_exp[i]};
+        mtfp21_t sin_v = {sin_mant[i], sin_exp[i]};
         mtfp21_t x0 = src[i];
         mtfp21_t x1 = src[i + half];
         dst[i] = mtfp21_add(mtfp21_mul(x0, cos_v), mtfp21_neg(mtfp21_mul(x1, sin_v)));
@@ -162,21 +164,27 @@ void shirley_attn_compute(
         shirley_gemv_mtfp16(v_m, act_mant, block_exp, p->wv_data, n, kv_dim, p->wv_wscale);
 
         /* 5. RoPE on Q and K */
-        const float * cos_pos = p->rope_cos + pos * (hd / 2);
-        const float * sin_pos = p->rope_sin + pos * (hd / 2);
+        int half = hd / 2;
+        const int32_t * cos_m = p->rope_cos_mant + pos * half;
+        const int8_t  * cos_e = p->rope_cos_exp  + pos * half;
+        const int32_t * sin_m = p->rope_sin_mant + pos * half;
+        const int8_t  * sin_e = p->rope_sin_exp  + pos * half;
 
         mtfp21_t q_rot[n]; /* VLA */
         for (int h = 0; h < n_head; h++)
-            shirley_rope_mtfp21(q_rot + h * hd, q_m + h * hd, cos_pos, sin_pos, hd);
+            shirley_rope_mtfp21(q_rot + h * hd, q_m + h * hd, cos_m, cos_e, sin_m, sin_e, hd);
 
         mtfp21_t k_rot[kv_dim]; /* VLA */
         for (int h = 0; h < n_kv; h++)
-            shirley_rope_mtfp21(k_rot + h * hd, k_m + h * hd, cos_pos, sin_pos, hd);
+            shirley_rope_mtfp21(k_rot + h * hd, k_m + h * hd, cos_m, cos_e, sin_m, sin_e, hd);
 
-        /* 6. Store K and V in cache */
+        /* 6. Store K and V in cache — native MTFP21, no float conversion */
         for (int i = 0; i < kv_dim; i++) {
-            p->k_cache[pos * kv_dim + i] = mtfp21_to_float(k_rot[i]);
-            p->v_cache[pos * kv_dim + i] = mtfp21_to_float(v_m[i]);
+            int idx = pos * kv_dim + i;
+            p->k_cache_mant[idx] = k_rot[i].mantissa;
+            p->k_cache_exp[idx]  = k_rot[i].exponent;
+            p->v_cache_mant[idx] = v_m[i].mantissa;
+            p->v_cache_exp[idx]  = v_m[i].exponent;
         }
 
         /* 7. Attention: Q@K^T → softmax → attn@V */
@@ -192,7 +200,8 @@ void shirley_attn_compute(
             for (int t = 0; t < kv_len; t++) {
                 mtfp21_t dot = {0, 0};
                 for (int d = 0; d < hd; d++) {
-                    mtfp21_t kval = mtfp21_from_float(p->k_cache[t * kv_dim + kv_h * hd + d]);
+                    int kidx = t * kv_dim + kv_h * hd + d;
+                    mtfp21_t kval = {p->k_cache_mant[kidx], p->k_cache_exp[kidx]};
                     dot = mtfp21_add(dot, mtfp21_mul(qh[d], kval));
                 }
                 scores[t] = mtfp21_mul(dot, mtfp21_from_float(p->kq_scale));
@@ -204,7 +213,8 @@ void shirley_attn_compute(
             for (int d = 0; d < hd; d++) {
                 mtfp21_t sum = {0, 0};
                 for (int t = 0; t < kv_len; t++) {
-                    mtfp21_t vval = mtfp21_from_float(p->v_cache[t * kv_dim + kv_h * hd + d]);
+                    int vidx = t * kv_dim + kv_h * hd + d;
+                    mtfp21_t vval = {p->v_cache_mant[vidx], p->v_cache_exp[vidx]};
                     sum = mtfp21_add(sum, mtfp21_mul(scores[t], vval));
                 }
                 out_h[d] = sum;
@@ -295,23 +305,35 @@ void shirley_attn_params_init(
     p->attn_norm_gamma = attn_norm ? (const float *)attn_norm->data : NULL;
     p->sub_norm_gamma = attn_sub_norm ? (const float *)attn_sub_norm->data : NULL;
 
-    /* RoPE sin/cos tables — CONST prime values */
+    /* RoPE sin/cos tables — precomputed as MTFP21 (CONST prime).
+     * Transcendentals consumed at load time. Zero float at runtime. */
     int half_dim = head_dim / 2;
-    p->rope_cos = (float *)malloc(max_seq_len * half_dim * sizeof(float));
-    p->rope_sin = (float *)malloc(max_seq_len * half_dim * sizeof(float));
+    int64_t rope_n = (int64_t)max_seq_len * half_dim;
+    p->rope_cos_mant = (int32_t *)malloc(rope_n * sizeof(int32_t));
+    p->rope_cos_exp  = (int8_t  *)malloc(rope_n * sizeof(int8_t));
+    p->rope_sin_mant = (int32_t *)malloc(rope_n * sizeof(int32_t));
+    p->rope_sin_exp  = (int8_t  *)malloc(rope_n * sizeof(int8_t));
     for (int pos = 0; pos < max_seq_len; pos++) {
         for (int i = 0; i < half_dim; i++) {
             float freq = 1.0f / powf(rope_freq_base, (float)(2 * i) / (float)head_dim);
             float angle = (float)pos * freq;
-            p->rope_cos[pos * half_dim + i] = cosf(angle);
-            p->rope_sin[pos * half_dim + i] = sinf(angle);
+            mtfp21_t c = mtfp21_from_float(cosf(angle));
+            mtfp21_t s = mtfp21_from_float(sinf(angle));
+            int64_t idx = (int64_t)pos * half_dim + i;
+            p->rope_cos_mant[idx] = c.mantissa;
+            p->rope_cos_exp[idx]  = c.exponent;
+            p->rope_sin_mant[idx] = s.mantissa;
+            p->rope_sin_exp[idx]  = s.exponent;
         }
     }
 
-    /* KV cache */
+    /* KV cache — native MTFP21. Geometric landmarks in base-3 space. */
     int kv_dim = n_kv_head * head_dim;
-    p->k_cache = (float *)calloc(max_seq_len * kv_dim, sizeof(float));
-    p->v_cache = (float *)calloc(max_seq_len * kv_dim, sizeof(float));
+    int64_t cache_n = (int64_t)max_seq_len * kv_dim;
+    p->k_cache_mant = (int32_t *)calloc(cache_n, sizeof(int32_t));
+    p->k_cache_exp  = (int8_t  *)calloc(cache_n, sizeof(int8_t));
+    p->v_cache_mant = (int32_t *)calloc(cache_n, sizeof(int32_t));
+    p->v_cache_exp  = (int8_t  *)calloc(cache_n, sizeof(int8_t));
     p->kv_pos = 0;
     p->kv_len = 0;
 
