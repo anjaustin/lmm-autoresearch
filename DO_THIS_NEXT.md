@@ -1,74 +1,87 @@
 # DO THIS NEXT
 
-## Current Status (2026-04-01, late session)
+## Current Status (2026-04-02)
 
-The per-layer loop is two Shirley custom ops. Zero ggml float ops inside.
+The core pipeline runs adaptive-width MTFP with zero float in the matmul path.
 
 ```
-inpL → [Shirley attention: norm+QKV+RoPE+attn+sub_norm+wo+residual]
-     → [Shirley FFN: norm+gate/up+relu²+mul+sub_norm+down+residual]
-     → next layer
+Embedding (float32 → MTFP21 at layer 0)
+→ 30 layers × [
+    MTFP16 attention (sign_epi16 QKV+wo, MTFP21 norm/RoPE/softmax/dot)
+    MTFP16 FFN (sign_epi16 gate/up/down, MTFP21 norm/ReLU²/mul)
+  ]
+→ MTFP21 output norm
+→ LM head (float32 — output boundary)
+→ Sampling
 ```
 
-Both ops run in MTFP21 internally. Int8 only at the matmul SIMD wire.
+All 210 ternary matmuls use `sign_epi16` with int16 mantissas. Zero `mtfp21_to_float` or `mtfp21_from_float` in the matmul path.
+
+### Adaptive-Width MTFP Family
+
+```
+MTFP21  int32 mantissa (25.4 bits)  scalar    RMSNorm rsqrt, softmax exp, RoPE, between-matmul ops
+MTFP16  int16 mantissa (15.8 bits)  16 lanes  matmul wire via sign_epi16 + block exponent
+MTFP8   int8  mantissa              32 lanes  (available, not used — MTFP16 is the production wire)
+```
+
+Same base-3 exponent everywhere. The geometric coordinate is invariant across widths. Width transitions are truncation (21→16) or extension (16→21) — the exponent doesn't change.
 
 ### What's Done
 
-**Phases 1-5: COMPLETE**
-- MTFP21 arithmetic: add, mul, div, rsqrt, exp, softmax, cmp (109/109 tests)
-- Phase 1: post-matmul int8 bridge on all 7 ternary matmuls
-- Phase 2: FFN as single custom op, fully MTFP21 (PPL matches baseline)
-- Phase 3: integer RoPE via precomputed CONST sin/cos tables
-- Phase 4: integer attention (Q@K^T + attn@V as MTFP21 dot products)
-- Phase 5: MTFP21 softmax (EXP prime) in the attention path
-- attn_norm, attn_sub_norm, wo matmul, wo_scale all folded into attention op
-- Attention residual ADD folded into attention op
+- **MTFP arithmetic:** 109/109 tests (add, mul, div, rsqrt, exp, softmax, cmp)
+- **MTFP16 matmul kernel:** `shirley_mtfp16_matmul.h` — sign_epi16 × 2-bit packed ternary, 6/6 tests, statistical validation (avg error 8e-05)
+- **Attention custom op:** attn_norm + QKV (sign_epi16) + RoPE (CONST) + Q@K^T (MTFP21) + softmax (EXP) + attn@V (MTFP21) + sub_norm + wo (sign_epi16) + residual
+- **FFN custom op:** ffn_norm + gate/up (sign_epi16) + ReLU² + mul + sub_norm + down (sign_epi16) + residual
+- **Output norm:** MTFP21 RMSNorm
+- **Generation:** Coherent, factually accurate across diverse prompts
+- **Geometric insight:** Numbers are positions. Exponents are coordinates. Documented.
 
-**Generation quality: VERIFIED**
-- Coherent across diverse prompts (factual, scientific, creative, technical)
-- Factual accuracy maintained (Paris, Heisenberg, etc.)
-- No loops, no garbage, good lexical diversity
+### What Remains: Float32 Remediation
 
-### What's Remaining (Phase 6: Model Boundaries)
+Two float32 operations remain. Both are at the model boundary between discrete tokens and continuous computation.
 
-The float32 remaining is at the edges of the model, not inside the layers:
+**1. Embedding lookup (input boundary)**
+- `model.tok_embd` is float32 [2560 × 128256]
+- Lookup produces float32 vector, immediately converted to MTFP21 at layer 0
+- Remediation options:
+  - (a) Convert embedding table to MTFP21 at model load. Lookup returns MTFP21 directly.
+  - (b) Accept: the lookup is one operation per token, and the float→MTFP21 conversion at layer 0 is already happening. The float is transient.
+- Blocker: the 128K × 2560 embedding table is 1.3 GB as float32, stored memory-mapped. Accessing all rows from a custom op segfaults at ~75% (ggml memory management issue). Needs investigation.
 
-1. **Embedding lookup** — `model.tok_embd` is float32. First operation on input tokens.
-   - Fix: quantize embedding table to int8 + MTFP21 scale at model load
-   - Or: convert float32 embedding output to MTFP21 at layer 0 input
+**2. LM head matmul (output boundary)**
+- `model.tok_embd` (tied weights) × normalized output → logits [128256]
+- Currently ggml float matmul because custom ops can't change output shape ([2560] → [128256])
+- Remediation options:
+  - (a) Shape donor tensor via ggml_map_custom2 (validated — shape works, embedding access blocks)
+  - (b) Bypass ggml: allocate output buffer, run MTFP matmul, hand float logits to sampling
+  - (c) Accept: logits are the last continuous values before discrete token selection. Float at this boundary is the conversion from MTFP21 geometry to probability space.
+- Blocker: same embedding access issue as (1).
 
-2. **Output norm** — `llm_build_norm` after the last layer. Float32 RMSNorm.
-   - Fix: replace with MTFP21 RMSNorm (same kernel as the layer norms)
+**3. KV cache stores float (internal)**
+- `mtfp21_to_float` on cache write, `mtfp21_from_float` on cache read
+- Remediation: store `mtfp21_t` structs directly in the cache. This makes the geometric interpretation real — each cache entry preserves its position coordinate (exponent).
+- No blocker. Straightforward struct change.
 
-3. **LM head matmul** — `model.output` or `model.tok_embd` (tied weights), float32.
-   - Fix: MTFP21 → int8, matmul against quantized embedding table
-   - Or: convert MTFP21 output to float for this one matmul (it's a model boundary)
+**4. RoPE tables store float (internal)**
+- Sin/cos precomputed as float, converted to MTFP21 per-element at runtime
+- Remediation: precompute as MTFP21 at model load. Eliminates per-element `mtfp21_from_float`.
+- No blocker. Straightforward.
 
-4. **Matmul boundary float** — `mtfp21_to_float` and `mtfp21_from_float` at pack/unpack
-   - This is transient format conversion, not persistent float storage
-   - Fix: native MTFP21 pack/unpack without float intermediary
+### Priority
 
-5. **KV cache stores float** — `mtfp21_to_float` on cache write, `mtfp21_from_float` on read
-   - Fix: store `mtfp21_t` structs directly (makes the geometric interpretation real)
-
-### Red-Team Findings
-
-See `shirley/docs/RED_TEAM_20260401.md` for full assessment. Key points:
-- The inter-op MTFP21 path is genuine — zero PPL loss vs baseline
-- The matmul boundary uses float as format conversion (transient, not persistent)
-- The KV cache is float, not MTFP21-native (geometric interpretation not yet implemented)
-- Speed is ~1.5 tok/s (scalar MTFP21 ops) — correctness first, performance later
-
-### Architectural Insight: GEOMETRIC_MTFP21.md
-
-Numbers are positions, not quantities. The MTFP21 exponent is a coordinate in base-3 geometric space. Multiply is translation. Add is co-location. The computational graph is intrinsic to the values. The KV cache is a set of landmarks. Attention is navigation. See `shirley/docs/GEOMETRIC_MTFP21.md`.
+1. KV cache → MTFP21 native (no blocker, makes geometry real)
+2. RoPE tables → MTFP21 (no blocker, eliminates conversion)
+3. LM head (needs embedding access fix or bypass)
+4. Embedding lookup (same blocker as LM head)
 
 ## Lessons
 
-1. **MTFP21 intermediates, not int8 intermediates.** Quantizing to int8 between ops lost 1+ PPL. MTFP21: zero loss.
-2. **The int8 is a wire format.** The matmul SIMD bus is int8 × ternary. That's hardware, not precision.
-3. **Custom ops beat patching.** One function per block > modifying 8 ggml dispatch points.
-4. **Don't accommodate float32, replace it.** Every time we defaulted to "keep float here," the architecture got worse.
-5. **gemv: nc is output rows, nr is unused.** Getting the parameter order wrong produces garbage.
-6. **ggml tensor custom fields don't survive graph compilation.** Use op_params or userdata.
+1. **Adaptive-width MTFP.** Same exponent, different mantissa. MTFP21 for precision, MTFP16 for SIMD, MTFP8 available. The exponent is the invariant.
+2. **sign_epi16 is the ternary matmul instruction.** Not sign_epi8. The wider mantissa preserves precision that int8 crushed.
+3. **Zero float in the matmul path.** Block-align MTFP21 → int16 mantissas → sign_epi16 → int32 → MTFP21. No mtfp21_to_float anywhere.
+4. **MTFP21 intermediates, not int8.** Quantizing between ops lost 1+ PPL. MTFP21: zero loss.
+5. **Custom ops beat patching.** One function per block. Don't fight the framework — bypass it.
+6. **Don't accommodate float32, replace it.** Every retreat to float made the architecture worse.
 7. **Numbers are positions.** The exponent is a coordinate. The graph is the geometry.
+8. **The LMM finds what you're not seeing.** The third vectorization approach (adaptive width) came from the manifold, not from incremental engineering.

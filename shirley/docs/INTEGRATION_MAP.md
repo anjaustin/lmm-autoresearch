@@ -358,20 +358,22 @@ O3: Sampling
     Priority: MEDIUM — can reuse A10's softmax
 ```
 
-## Integration Scorecard
+## Integration Scorecard (2026-04-02)
 
-| Category | Count | Status | Remaining work |
-|----------|-------|--------|---------------|
-| Ternary matmul (sign_epi8) | 7 | **DONE** | 0 |
-| Post-matmul rescale (i32→i8) | 7 | **INTEGRATED** | 0 (commit 843eef4) |
-| FFN block (MTFP21 custom op) | 1 | **INTEGRATED** | 0 (commit b0489e1) |
-| MTFP21 exp + softmax + cmp | 1 | **BUILT** | Wire into attention path |
-| RoPE (integer) | 2 | **NEEDS BUILDING** | Precompute sin/cos as Q15, build kernel |
-| Integer matmul (i8×i8→i32) | 3 | **NEEDS BUILDING** | Q@K^T, attn@V, LM head |
-| Embedding (i8) | 1 | **NEEDS BUILDING** | Quantize table at model load |
-| Attention custom op | 1 | **NEEDS BUILDING** | Same pattern as FFN custom op |
+| Category | Status | Notes |
+|----------|--------|-------|
+| Ternary matmul (sign_epi16) | **COMPLETE** | 210 matmuls, zero float, MTFP16 wire |
+| Attention custom op | **COMPLETE** | norm+QKV+RoPE+attn+sub_norm+wo+residual |
+| FFN custom op | **COMPLETE** | norm+gate/up+relu²+mul+sub_norm+down+residual |
+| Output norm | **COMPLETE** | MTFP21 RMSNorm |
+| MTFP21 arithmetic | **COMPLETE** | 109/109 tests (rsqrt, exp, softmax, cmp) |
+| MTFP16 matmul kernel | **COMPLETE** | shirley_mtfp16_matmul.h, 6/6 tests |
+| Embedding lookup | **REMAINING** | float32 table, blocked by memory access issue |
+| LM head matmul | **REMAINING** | float32, blocked by shape + memory access |
+| KV cache | **REMAINING** | stores float, should store MTFP21 |
+| RoPE tables | **REMAINING** | stores float, should store MTFP21 |
 
-**Total: 40 operations. FFN path complete. Attention path remaining.**
+**Core pipeline: COMPLETE. Remaining work is at model boundaries.**
 
 ## The Critical Path
 
@@ -381,37 +383,13 @@ All 7 ternary matmuls write int8 via `shirley_rescale_raw_to_i8` at all 4 ggml.c
 
 Commits: bc23f57 (Option D validation), 843eef4 (Phase 1 integration).
 
-### Phase 2: FFN as unified MTFP21 custom op — COMPLETE
+### Phase 2: FFN custom op — COMPLETE (adaptive-width MTFP)
 
-The entire FFN block replaced with one `ggml_map_custom1` call to `shirley_ffn_compute`. Internally, every value is MTFP21 at 25.4-bit precision. The int8 appears ONLY at the matmul SIMD interface — a wire format, not a precision boundary.
+Entire FFN block as one `ggml_map_custom1`. Matmuls use MTFP16 via sign_epi16 (zero float conversion). Between-matmul ops (ReLU, square, multiply) stay MTFP21 for full precision. Commit ba5deaf.
 
-Operations fused: ffn_norm (MTFP21 RMSNorm) → gate/up matmuls (pack→sign_epi8→MTFP21) → ReLU (MTFP21) → square (MTFP21) → element-wise mul (MTFP21) → ffn_sub_norm (MTFP21 RMSNorm) → down matmul (pack→sign_epi8→MTFP21) → residual ADD (MTFP21).
+### Phases 3-5: Attention custom op — COMPLETE
 
-PPL: 17.887 (5-chunk), baseline 17.873 — within noise.
-
-Key insight: int8 quantization between every op lost 1+ PPL. MTFP21 intermediates: zero PPL loss. The matmul wire format is not a precision decision.
-
-Commits: 75e24d8 (scaffold), 937fe7f (gemv fix + batch), b0489e1 (MTFP21 rewrite).
-
-### Phase 3: Integer RoPE
-
-Precompute sin/cos tables as Q15 int16 at model load. Build `shirley_rope_i8()` — per-element: two `mulhrs_epi16` + `add_epi16` + pack to i8.
-
-**This completes:** Q and K preparation in integer.
-
-### Phase 4: Integer attention matmuls
-
-Build `shirley_matmul_i8_i8()` for Q@K^T and attn@V. Standard int8×int8→int32 matmul using AVX2 `_mm256_maddubs_epi16` + `_mm256_madd_epi16`. MTFP21 scale tracking.
-
-**This completes:** Attention score computation and context aggregation in integer.
-
-### Phase 5: Softmax — the EXP prime
-
-MTFP21 exp() is BUILT (commit 6bb5ccb): LUT + linear interpolation, 256 entries, max error 9.5e-6. MTFP21 softmax is BUILT: subtract max → exp → sum → normalize → quantize. 109/109 tests pass.
-
-Remaining: wire into the attention custom op (same pattern as FFN — one function, MTFP21 throughout). CPU fallback first, iGPU dispatch (V_EXP_F32) is an optimization.
-
-**This completes:** The attention mechanism end-to-end without float32.
+Entire attention block as one `ggml_map_custom1`. QKV + wo matmuls use MTFP16 sign_epi16. RoPE uses precomputed CONST sin/cos tables (MTFP21 multiply + add). Q@K^T and attn@V are MTFP21 dot products. Softmax uses mtfp21_exp (the EXP prime). Commit ba5deaf.
 
 ### Phase 6: Embedding + LM head
 

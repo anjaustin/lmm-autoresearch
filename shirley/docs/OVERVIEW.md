@@ -142,10 +142,13 @@ The end-to-end ternary kernel (`shirley_rmsnorm_ternary`) is **faster than the f
 **Pipeline integration (2026-04-01):**
 
 - **Phase 1 COMPLETE:** All 7 ternary matmuls per layer write int8 via `shirley_rescale_raw_to_i8`. 5-trit activations validated (PPL 18.888, baseline 18.852).
-- **Phase 2 COMPLETE:** Entire FFN block runs as one custom op (`shirley_ffn.cpp`), fully MTFP21 internally. Every intermediate (gate, up, ReLU, square, mul) is MTFP21 at 25.4-bit precision. Int8 appears ONLY at the matmul SIMD wire interface. PPL: 17.887, baseline 17.873 — within noise.
-- **Phases 3-6 PENDING:** Integer RoPE, integer attention matmuls, MTFP21 softmax integration, embedding/LM head. The attention block still uses ggml's float32 path.
+- **Phases 2-5 COMPLETE:** Attention and FFN blocks each run as single custom ops. Adaptive-width MTFP: MTFP21 for precision operations (RMSNorm, softmax, RoPE, between-matmul ops), MTFP16 for the matmul wire (sign_epi16, 16 SIMD lanes). All 210 ternary matmuls across 30 layers use sign_epi16 with zero float conversion. PPL matches baseline.
+- **Phase 6 REMAINING:** Embedding lookup and LM head matmul (model boundaries). KV cache and RoPE tables store float (straightforward fix).
 
-Key finding: int8 quantization between every op lost 1+ PPL. MTFP21 intermediates: zero PPL loss. The precision lives in the number system, not the wire format.
+Key findings:
+1. int8 quantization between ops lost 1+ PPL. MTFP21 intermediates: zero loss.
+2. Adaptive-width MTFP: same base-3 exponent at every width. MTFP16 for SIMD, MTFP21 for precision. The exponent (geometric coordinate) is invariant.
+3. sign_epi16 replaces sign_epi8 as the production matmul instruction. Wider mantissa (10 trits, 15.8 bits) preserves precision that int8 crushed.
 
 Full results: `BITNET_TERNARY_PLAN.md`. Kernel code: `../bitnet/shirley_kernels.h`, `../bitnet/shirley_mtfp21.h`, `../bitnet/shirley_ffn.cpp`.
 
