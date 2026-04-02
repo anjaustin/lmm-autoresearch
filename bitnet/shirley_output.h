@@ -23,7 +23,10 @@ struct shirley_output_params {
     /* Embedding table converted to MTFP21 at model load.
      * Layout: [vocab_size][n_embd] as mtfp21_t structs.
      * Each entry is a position in the geometric space. */
-    void * embd_mtfp21;   /* mtfp21_t[vocab_size * n_embd] */
+    void * embd_mtfp21;   /* mtfp21_t[vocab_size * n_embd], lazy-converted */
+
+    /* For lazy conversion — tensor stored at init, data read at first compute */
+    const void * _tok_embd_tensor;  /* struct ggml_tensor * (opaque to avoid include) */
 
     int ready;
 };

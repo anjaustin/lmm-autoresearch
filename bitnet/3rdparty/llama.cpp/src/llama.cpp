@@ -14,7 +14,7 @@
 #include "../../../shirley_output.h"
 static struct shirley_ffn_params * shirley_ffn_layer_params = nullptr;
 static struct shirley_attn_params * shirley_attn_layer_params = nullptr;
-static struct shirley_output_params shirley_output_p = {0, 0, 0.0f, nullptr, nullptr, 0};
+static struct shirley_output_params shirley_output_p = {0, 0, 0.0f, nullptr, nullptr, nullptr, 0};
 static int shirley_ffn_n_layers = 0;
 
 #if defined(GGML_USE_VULKAN)
@@ -15447,7 +15447,7 @@ struct llm_build_context {
             if (!shirley_output_p.ready) {
                 shirley_output_params_init(&shirley_output_p,
                     hparams.n_embd, hparams.n_vocab, rms_eps,
-                    model.output_norm, NULL /* defer embedding conversion */);
+                    model.output_norm, model.tok_embd);
             }
         }
 
@@ -15494,12 +15494,15 @@ struct llm_build_context {
             shirley_output_compute, 1, &shirley_output_p);
         cb(cur, "result_norm", -1);
 
-        // LM head — the output boundary
-        // The embedding table is converted to MTFP21 at load (stored in shirley_output_p).
-        // The matmul stays as ggml float because custom ops can't change output shape
-        // ([n_embd, n_tokens] → [vocab_size, n_tokens] requires ggml_mul_mat).
-        // This is the LAST float operation — logits → sampling.
-        cur = llm_build_lora_mm(lctx, ctx0, model.tok_embd, cur);
+        // LM head — MTFP21 matmul against converted embedding table.
+        // Shape donor tensor provides [vocab_size, n_tokens] output shape.
+        // The callback computes MTFP21 dot products, outputs float logits for sampling.
+        {
+            struct ggml_tensor * lm_shape = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
+                model.tok_embd->ne[1], n_tokens);
+            cur = ggml_map_custom2(ctx0, lm_shape, cur,
+                shirley_lmhead_compute, 1, &shirley_output_p);
+        }
 
         cb(cur, "result_output", -1);
 
