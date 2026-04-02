@@ -15421,15 +15421,15 @@ struct llm_build_context {
 
             shirley_attn_layer_params = (struct shirley_attn_params *)calloc(
                 n_layer, sizeof(struct shirley_attn_params));
-            const int64_t n_embd_head = hparams.n_embd_head_v;
+            const int64_t n_embd_head_init = hparams.n_embd_head_v;
             for (int il = 0; il < n_layer; il++) {
                 shirley_attn_params_init(
                     &shirley_attn_layer_params[il],
                     hparams.n_embd, hparams.n_head(), hparams.n_head_kv(),
-                    (int)n_embd_head,
+                    (int)n_embd_head_init,
                     4096,  /* max_seq_len — matches model context */
                     rms_eps,
-                    1.0f / sqrtf((float)n_embd_head),
+                    1.0f / sqrtf((float)n_embd_head_init),
                     il,
                     hparams.rope_freq_base_train,
                     model.layers[il].wq,
@@ -15448,11 +15448,8 @@ struct llm_build_context {
 
         inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
 
-        // inp_pos - contains the positions
-        struct ggml_tensor * inp_pos = build_inp_pos();
-
-        // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
-        struct ggml_tensor * KQ_mask = build_inp_KQ_mask();
+        /* Shirley: KV cache managed by shirley_attn_compute.
+         * kv_pos tracks position across calls — NOT reset here. */
 
         for (int il = 0; il < n_layer; ++il) {
             struct ggml_tensor * inpSA = inpL;
