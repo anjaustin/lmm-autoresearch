@@ -15494,15 +15494,8 @@ struct llm_build_context {
             shirley_output_compute, 1, &shirley_output_p);
         cb(cur, "result_norm", -1);
 
-        // LM head — MTFP21 matmul against converted embedding table.
-        // Shape donor tensor provides [vocab_size, n_tokens] output shape.
-        // The callback computes MTFP21 dot products, outputs float logits for sampling.
-        {
-            struct ggml_tensor * lm_shape = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
-                model.tok_embd->ne[1], n_tokens);
-            cur = ggml_map_custom2(ctx0, lm_shape, cur,
-                shirley_lmhead_compute, 1, &shirley_output_p);
-        }
+        // LM head — ggml float matmul (output boundary)
+        cur = llm_build_lora_mm(lctx, ctx0, model.tok_embd, cur);
 
         cb(cur, "result_output", -1);
 
