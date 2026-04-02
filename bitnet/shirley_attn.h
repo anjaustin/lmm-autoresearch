@@ -38,8 +38,9 @@ struct shirley_attn_params {
     /* Per-layer learned scales */
     float wo_lscale;       /* wo_scale, 1.0 if absent */
 
-    /* attn_sub_norm gamma (float, for now) */
-    const float * sub_norm_gamma;  /* [n_embd] */
+    /* Norm gammas (float, for now) */
+    const float * attn_norm_gamma;  /* [n_embd] — input norm */
+    const float * sub_norm_gamma;   /* [n_embd] — post-attention norm */
 
     /* RoPE sin/cos tables — precomputed MTFP21, stored as float pairs.
      * Layout: [max_seq_len][head_dim/2] for both sin and cos.
@@ -90,6 +91,7 @@ void shirley_attn_params_init(
     const struct ggml_tensor * wv,
     const struct ggml_tensor * wo,
     const struct ggml_tensor * wo_scale_t,
+    const struct ggml_tensor * attn_norm,
     const struct ggml_tensor * attn_sub_norm);
 
 #ifdef __cplusplus

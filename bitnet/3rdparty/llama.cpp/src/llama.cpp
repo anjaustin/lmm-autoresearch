@@ -15437,6 +15437,7 @@ struct llm_build_context {
                     model.layers[il].wv,
                     model.layers[il].wo,
                     model.layers[il].wo_scale,
+                    model.layers[il].attn_norm,
                     model.layers[il].attn_sub_norm
                 );
             }
@@ -15457,16 +15458,10 @@ struct llm_build_context {
         for (int il = 0; il < n_layer; ++il) {
             struct ggml_tensor * inpSA = inpL;
 
-            // norm
-            cur = llm_build_norm(ctx0, inpL, hparams,
-                    model.layers[il].attn_norm, NULL,
-                    LLM_NORM_RMS, cb, il);
-            cb(cur, "attn_norm", il);
-
             // self-attention — Shirley MTFP21 custom op
-            // Includes: QKV matmuls + RoPE + Q@K^T + softmax + attn@V + sub_norm + wo + scale
+            // Includes: attn_norm + QKV matmuls + RoPE + Q@K^T + softmax + attn@V + sub_norm + wo + scale
             {
-                cur = ggml_map_custom1(ctx0, cur,
+                cur = ggml_map_custom1(ctx0, inpL,
                     shirley_attn_compute, 1,
                     &shirley_attn_layer_params[il]);
                 cb(cur, "attn_o_out", il);

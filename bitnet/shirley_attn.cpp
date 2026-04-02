@@ -182,6 +182,23 @@ void shirley_attn_compute(
         mtfp21_t inp_m[n]; /* VLA */
         for (int i = 0; i < n; i++) inp_m[i] = mtfp21_from_float(input[i]);
 
+        /* 0. attn_norm: MTFP21 RMSNorm on input */
+        {
+            mtfp21_t sum_sq = {0, 0};
+            for (int i = 0; i < n; i++)
+                sum_sq = mtfp21_add(sum_sq, mtfp21_mul(inp_m[i], inp_m[i]));
+            mtfp21_t mean = mtfp21_div_scalar(sum_sq, n);
+            mtfp21_t scale = mtfp21_rsqrt(
+                mtfp21_add(mean, mtfp21_from_float(p->eps)));
+            for (int i = 0; i < n; i++) {
+                inp_m[i] = mtfp21_mul(inp_m[i], scale);
+                if (p->attn_norm_gamma) {
+                    inp_m[i] = mtfp21_mul(inp_m[i],
+                        mtfp21_from_float(p->attn_norm_gamma[i]));
+                }
+            }
+        }
+
         /* 1. Q matmul: MTFP21 → pack → ternary matmul → MTFP21
          *    wq: [n_embd, n_embd] (n_head * head_dim = 2560 output) */
         int8_t act_i8[n]; /* VLA */
@@ -338,6 +355,7 @@ void shirley_attn_params_init(
     const struct ggml_tensor * wv,
     const struct ggml_tensor * wo,
     const struct ggml_tensor * wo_scale_t,
+    const struct ggml_tensor * attn_norm,
     const struct ggml_tensor * attn_sub_norm
 ) {
     p->n_embd = n_embd;
@@ -363,6 +381,7 @@ void shirley_attn_params_init(
     p->wv_wscale = *(const float *)((const uint8_t *)wv->data + (wv->ne[0] * wv->ne[1] / 4));
     p->wo_wscale = *(const float *)((const uint8_t *)wo->data + (wo->ne[0] * wo->ne[1] / 4));
     p->wo_lscale = wo_scale_t ? *(const float *)wo_scale_t->data : 1.0f;
+    p->attn_norm_gamma = attn_norm ? (const float *)attn_norm->data : NULL;
     p->sub_norm_gamma = attn_sub_norm ? (const float *)attn_sub_norm->data : NULL;
 
     /* Precompute RoPE sin/cos tables — CONST prime values.
