@@ -1346,6 +1346,7 @@ add_library(ggml
             ../../../../src/ggml-bitnet-mad.cpp
             ../../../../src/ggml-bitnet-lut.cpp
             ../../../../shirley_ffn.cpp
+            ../../../../shirley_attn.cpp
             ${GGML_SOURCES_CUDA}      ${GGML_HEADERS_CUDA}
             ${GGML_SOURCES_METAL}     ${GGML_HEADERS_METAL}
             ${GGML_SOURCES_RPC}       ${GGML_HEADERS_RPC}

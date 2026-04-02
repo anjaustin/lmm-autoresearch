@@ -8,9 +8,11 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
-/* Shirley: integer FFN custom op */
+/* Shirley: integer FFN and attention custom ops */
 #include "../../../shirley_ffn.h"
+#include "../../../shirley_attn.h"
 static struct shirley_ffn_params * shirley_ffn_layer_params = nullptr;
+static struct shirley_attn_params * shirley_attn_layer_params = nullptr;
 static int shirley_ffn_n_layers = 0;
 
 #if defined(GGML_USE_VULKAN)
@@ -15398,12 +15400,13 @@ struct llm_build_context {
         // mutable variable, needed during the last layer of the computation to skip unused tokens
         int32_t n_tokens = this->n_tokens;
 
-        /* Shirley: initialize FFN params on first call */
+        /* Shirley: initialize FFN and attention params on first call */
         if (!shirley_ffn_layer_params && n_layer > 0) {
             shirley_ffn_n_layers = n_layer;
+            float rms_eps = hparams.f_norm_rms_eps;
+
             shirley_ffn_layer_params = (struct shirley_ffn_params *)calloc(
                 n_layer, sizeof(struct shirley_ffn_params));
-            float rms_eps = hparams.f_norm_rms_eps;
             for (int il = 0; il < n_layer; il++) {
                 shirley_ffn_params_init(
                     &shirley_ffn_layer_params[il],
@@ -15413,6 +15416,25 @@ struct llm_build_context {
                     model.layers[il].ffn_down, model.layers[il].ffn_down_scale,
                     model.layers[il].ffn_norm,
                     model.layers[il].ffn_sub_norm
+                );
+            }
+
+            shirley_attn_layer_params = (struct shirley_attn_params *)calloc(
+                n_layer, sizeof(struct shirley_attn_params));
+            const int64_t n_embd_head = hparams.n_embd_head_v;
+            for (int il = 0; il < n_layer; il++) {
+                shirley_attn_params_init(
+                    &shirley_attn_layer_params[il],
+                    hparams.n_embd, hparams.n_head(), hparams.n_head_kv(),
+                    (int)n_embd_head,
+                    4096,  /* max_seq_len — matches model context */
+                    rms_eps,
+                    1.0f / sqrtf((float)n_embd_head),
+                    il,
+                    hparams.rope_freq_base_train,
+                    model.layers[il].wq,
+                    model.layers[il].wk,
+                    model.layers[il].wv
                 );
             }
         }
@@ -15441,51 +15463,15 @@ struct llm_build_context {
                     LLM_NORM_RMS, cb, il);
             cb(cur, "attn_norm", il);
 
-            // self-attention
+            // self-attention — Shirley MTFP21 custom op
             {
-                // rope freq factors for llama3; may return nullptr for llama2 and other models
-                struct ggml_tensor * rope_factors = build_rope_factors(il);
-                // printf("%f\n\n\n\n",((float*)rope_factors->data)[1]);
-
-                // compute Q and K and RoPE them
-                struct ggml_tensor * Qcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wq, cur);
-                cb(Qcur, "Qcur", il);
-                if (model.layers[il].bq) {
-                    Qcur = ggml_add(ctx0, Qcur, model.layers[il].bq);
-                    cb(Qcur, "Qcur", il);
-                }
-
-                struct ggml_tensor * Kcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wk, cur);
-                cb(Kcur, "Kcur", il);
-                if (model.layers[il].bk) {
-                    Kcur = ggml_add(ctx0, Kcur, model.layers[il].bk);
-                    cb(Kcur, "Kcur", il);
-                }
-
-                struct ggml_tensor * Vcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wv, cur);
-                cb(Vcur, "Vcur", il);
-                if (model.layers[il].bv) {
-                    Vcur = ggml_add(ctx0, Vcur, model.layers[il].bv);
-                    cb(Vcur, "Vcur", il);
-                }
-
-                Qcur = ggml_rope_ext(
-                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, rope_factors,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                );
-                cb(Qcur, "Qcur", il);
-
-                Kcur = ggml_rope_ext(
-                    ctx0, ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens), inp_pos, rope_factors,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                );
-                cb(Kcur, "Kcur", il);
-
-                cur = llm_build_kv(ctx0, lctx, kv_self, gf,
-                        NULL, NULL,
-                        Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, 1.0f/sqrtf(float(n_embd_head)), cb, il);
+                /* Shirley Phase 3-5: QKV matmuls + RoPE + Q@K^T + softmax + attn@V
+                 * All in MTFP21. RoPE uses precomputed CONST sin/cos tables.
+                 * Softmax uses mtfp21_exp (the EXP prime). */
+                cur = ggml_map_custom1(ctx0, cur,
+                    shirley_attn_compute, 1,
+                    &shirley_attn_layer_params[il]);
+                cb(cur, "shirley_attn", il);
 
                 cur = llm_build_norm(ctx0, cur, hparams,
                         model.layers[il].attn_sub_norm, NULL,
