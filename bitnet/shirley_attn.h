@@ -58,11 +58,10 @@ struct shirley_attn_params {
     int max_seq_len;
     float rope_freq_base;
 
-    /* KV cache — native MTFP21. Each entry is a position in the geometric space.
-     * Mantissa and exponent stored in parallel arrays.
+    /* KV cache — native MTFP21 per element.
      * Layout: [max_seq_len][n_kv_head * head_dim] */
-    int32_t * k_cache_mant;   /* mantissas */
-    int8_t  * k_cache_exp;    /* exponents */
+    int32_t * k_cache_mant;
+    int8_t  * k_cache_exp;
     int32_t * v_cache_mant;
     int8_t  * v_cache_exp;
     int kv_pos;          /* current write position in cache */

@@ -66,32 +66,44 @@ static inline int8_t mtfp16_block_align_vec(
  *    real = raw × 3^(exp_a + exp_b)
  * ================================================================ */
 
-static inline int32_t mtfp16_dot_simd(
+static inline int64_t mtfp16_dot_simd(
     const int16_t * restrict a,
     const int16_t * restrict b,
     int n
 ) {
+    int64_t total = 0;
     __m256i acc = _mm256_setzero_si256();
     int i;
+    int block = 0;
 
     for (i = 0; i + 16 <= n; i += 16) {
         __m256i va = _mm256_loadu_si256((const __m256i *)(a + i));
         __m256i vb = _mm256_loadu_si256((const __m256i *)(b + i));
-        /* madd: a[0]*b[0]+a[1]*b[1], a[2]*b[2]+a[3]*b[3], ... → 8 int32 */
         acc = _mm256_add_epi32(acc, _mm256_madd_epi16(va, vb));
+        block += 16;
+
+        /* Flush to int64 every 64 elements to prevent int32 overflow.
+         * Max per pair: 29524² × 2 ≈ 1.74B. 4 pairs (64 elems) = 6.96B > int32.
+         * Flush at 32 elems (2 pairs per lane × 8 lanes) to be safe. */
+        if (block >= 32) {
+            int32_t tmp[8];
+            _mm256_storeu_si256((__m256i *)tmp, acc);
+            for (int j = 0; j < 8; j++) total += (int64_t)tmp[j];
+            acc = _mm256_setzero_si256();
+            block = 0;
+        }
     }
 
-    /* Horizontal sum */
-    __m128i lo = _mm256_castsi256_si128(acc);
-    __m128i hi = _mm256_extracti128_si256(acc, 1);
-    __m128i sum4 = _mm_add_epi32(lo, hi);
-    sum4 = _mm_hadd_epi32(sum4, sum4);
-    sum4 = _mm_hadd_epi32(sum4, sum4);
-    int32_t total = _mm_cvtsi128_si32(sum4);
+    /* Flush remaining */
+    {
+        int32_t tmp[8];
+        _mm256_storeu_si256((__m256i *)tmp, acc);
+        for (int j = 0; j < 8; j++) total += (int64_t)tmp[j];
+    }
 
     /* Scalar tail */
     for (; i < n; i++) {
-        total += (int32_t)a[i] * (int32_t)b[i];
+        total += (int64_t)a[i] * (int64_t)b[i];
     }
 
     return total;

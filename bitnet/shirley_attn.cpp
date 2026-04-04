@@ -183,7 +183,7 @@ void shirley_attn_compute(
         for (int h = 0; h < n_kv; h++)
             shirley_rope_mtfp21(k_rot + h * hd, k_m + h * hd, cos_m, cos_e, sin_m, sin_e, hd);
 
-        /* 6. Store K and V in cache — native MTFP21, no float conversion */
+        /* 6. Store K and V in cache — native MTFP21 per element */
         for (int i = 0; i < kv_dim; i++) {
             int idx = pos * kv_dim + i;
             p->k_cache_mant[idx] = k_rot[i].mantissa;
@@ -192,7 +192,7 @@ void shirley_attn_compute(
             p->v_cache_exp[idx]  = v_m[i].exponent;
         }
 
-        /* 7. Attention: Q@K^T → softmax → attn@V (scalar MTFP21 for now) */
+        /* 7. Attention: Q@K^T → softmax → attn@V (scalar MTFP21) */
         int gqa_ratio = n_head / n_kv;
         int kv_len = pos + 1;
         mtfp21_t attn_out[n]; /* VLA */
@@ -341,7 +341,7 @@ void shirley_attn_params_init(
         }
     }
 
-    /* KV cache — native MTFP21. Geometric landmarks in base-3 space. */
+    /* KV cache — native MTFP21 per element */
     int kv_dim = n_kv_head * head_dim;
     int64_t cache_n = (int64_t)max_seq_len * kv_dim;
     p->k_cache_mant = (int32_t *)calloc(cache_n, sizeof(int32_t));
