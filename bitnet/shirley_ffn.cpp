@@ -17,6 +17,7 @@
 #define restrict
 #include "shirley_kernels.h"
 #include "shirley_mtfp16_matmul.h"
+#include "shirley_mtfp16_ops.h"
 
 #include "shirley_convert.h"
 
@@ -167,11 +168,31 @@ void shirley_ffn_compute(
         shirley_gemv_mtfp16(up_m, act_mant, block_exp,
             p->up_data, n, n_ff, p->up_wscale * p->up_lscale);
 
-        /* 4-6. ReLU → Square → gate² × up (full MTFP21 precision) */
-        mtfp21_relu(gate_m, gate_m, n_ff);
-        mtfp21_square(gate_m, gate_m, n_ff);
+        /* 4-6. ReLU → Square → gate² × up (SIMD where possible) */
+
+        /* Convert gate and up from MTFP21 to MTFP16 parallel arrays */
+        int16_t gate_mant16[n_ff], up_mant16[n_ff]; /* VLA */
+        int8_t gate_exp16[n_ff], up_exp16[n_ff]; /* VLA */
+        for (int i = 0; i < n_ff; i++) {
+            mtfp16_local_t g16 = to_mtfp16(gate_m[i]);
+            gate_mant16[i] = g16.mantissa;
+            gate_exp16[i] = g16.exponent;
+            mtfp16_local_t u16 = to_mtfp16(up_m[i]);
+            up_mant16[i] = u16.mantissa;
+            up_exp16[i] = u16.exponent;
+        }
+
+        /* 4. ReLU — SIMD 16 lanes */
+        mtfp16_relu_simd(gate_mant16, gate_exp16, gate_mant16, gate_exp16, n_ff);
+
+        /* 5. Square — SIMD 8 lanes (widen to int32) */
+        int32_t sq_mant32[n_ff]; /* VLA */
+        int8_t sq_exp8[n_ff]; /* VLA */
+        mtfp16_square_simd(sq_mant32, sq_exp8, gate_mant16, gate_exp16, n_ff);
+
+        /* 6. gate² × up — int32 × int16 → MTFP21 */
         mtfp21_t ffn_out[n_ff]; /* VLA */
-        mtfp21_elem_mul(ffn_out, gate_m, up_m, n_ff);
+        mtfp_elem_mul_32x16(ffn_out, sq_mant32, sq_exp8, up_mant16, up_exp16, n_ff);
 
         /* 7. Sub-norm → block-aligned MTFP16 for down matmul */
         int16_t sub_mant[n_ff]; /* VLA */

@@ -16,6 +16,7 @@
 #define restrict
 #include "shirley_kernels.h"
 #include "shirley_mtfp16_matmul.h"
+#include "shirley_mtfp16_ops.h"
 
 #include "shirley_convert.h"
 
@@ -191,7 +192,7 @@ void shirley_attn_compute(
             p->v_cache_exp[idx]  = v_m[i].exponent;
         }
 
-        /* 7. Attention: Q@K^T → softmax → attn@V */
+        /* 7. Attention: Q@K^T → softmax → attn@V (scalar MTFP21 for now) */
         int gqa_ratio = n_head / n_kv;
         int kv_len = pos + 1;
         mtfp21_t attn_out[n]; /* VLA */
