@@ -23,6 +23,7 @@
 
 #include "3rdparty/llama.cpp/ggml/include/ggml.h"
 #include "shirley_ffn.h"
+#include "shirley_profile.h"
 
 /* ================================================================
  *  MTFP16 type and conversions (inline for this file)
@@ -199,14 +200,19 @@ void shirley_ffn_compute(
         const float * input = (const float *)a->data + tok * n;
         float * out_tok = output + tok * n;
 
+        SP_START;
+
         /* Convert input to MTFP21 */
         mtfp21_t inp_m[n]; /* VLA */
         for (int i = 0; i < n; i++) inp_m[i] = mtfp21_from_float(input[i]);
+        SP_LAP(ffn_input_conv);
 
         /* 1. RMSNorm → block-aligned MTFP16 for matmul (MTFP21 precision norm) */
         int16_t act_mant[n]; /* VLA — block-aligned mantissas */
         int8_t block_exp = mtfp21_rmsnorm_to_mtfp16(
             act_mant, inp_m, p->ffn_norm_gamma_mant, p->ffn_norm_gamma_exp, n, p->eps_mant, p->eps_exp);
+
+        SP_LAP(ffn_norm);
 
         /* 2. Gate matmul: MTFP16 × ternary → MTFP21 (pure integer, sign_epi16) */
         mtfp21_t gate_m[n_ff]; /* VLA */
@@ -217,6 +223,8 @@ void shirley_ffn_compute(
         mtfp21_t up_m[n_ff]; /* VLA */
         shirley_gemv_mtfp16(up_m, act_mant, block_exp,
             p->up_data, n, n_ff, p->up_wscale * p->up_lscale);
+
+        SP_LAP(ffn_gate_up);
 
         /* 4-6. ReLU → Square → gate² × up (SIMD where possible) */
 
@@ -244,21 +252,28 @@ void shirley_ffn_compute(
         mtfp21_t ffn_out[n_ff]; /* VLA */
         mtfp_elem_mul_32x16(ffn_out, sq_mant32, sq_exp8, up_mant16, up_exp16, n_ff);
 
+        SP_LAP(ffn_trivials);
+
         /* 7. Sub-norm → block-aligned MTFP16 for down matmul */
         int16_t sub_mant[n_ff]; /* VLA */
         int8_t sub_exp = mtfp21_rmsnorm_to_mtfp16(
             sub_mant, ffn_out, p->ffn_sub_norm_gamma_mant, p->ffn_sub_norm_gamma_exp, n_ff, p->eps_mant, p->eps_exp);
+
+        SP_LAP(ffn_sub_norm);
 
         /* 8. Down matmul: MTFP16 × ternary → MTFP21 */
         mtfp21_t down_m[n]; /* VLA */
         shirley_gemv_mtfp16(down_m, sub_mant, sub_exp,
             p->down_data, n_ff, n, p->down_wscale * p->down_lscale);
 
+        SP_LAP(ffn_down);
+
         /* 9. Residual ADD in MTFP21, convert to float for ggml */
         for (int i = 0; i < n; i++) {
             mtfp21_t result = mtfp21_add(down_m[i], inp_m[i]);
             out_tok[i] = mtfp21_to_float(result);
         }
+        SP_LAP(ffn_residual);
     }
 
     static int logged = 0;

@@ -22,6 +22,7 @@
 
 #include "3rdparty/llama.cpp/ggml/include/ggml.h"
 #include "shirley_attn.h"
+#include "shirley_profile.h"
 
 /* ================================================================
  *  MTFP16 conversions (same as in shirley_ffn.cpp — should factor out)
@@ -131,9 +132,12 @@ void shirley_attn_compute(
         float * out_tok = output + tok * n;
         int pos = p->kv_pos + tok;
 
+        SP_START;
+
         /* Convert input to MTFP21 */
         mtfp21_t inp_m[n]; /* VLA */
         for (int i = 0; i < n; i++) inp_m[i] = mtfp21_from_float(input[i]);
+        SP_LAP(attn_input_conv);
 
         /* 0. attn_norm: SIMD RMSNorm */
         {
@@ -144,6 +148,8 @@ void shirley_attn_compute(
                 n, p->eps_mant, p->eps_exp);
             for (int i = 0; i < n; i++) { inp_m[i].mantissa = m[i]; inp_m[i].exponent = e[i]; }
         }
+
+        SP_LAP(attn_norm);
 
         /* 1. Block-align for QKV matmuls (MTFP21 → MTFP16) */
         int16_t act_mant[n]; /* VLA */
@@ -162,6 +168,8 @@ void shirley_attn_compute(
         mtfp21_t v_m[kv_dim]; /* VLA */
         shirley_gemv_mtfp16(v_m, act_mant, block_exp, p->wv_data, n, kv_dim, p->wv_wscale);
 
+        SP_LAP(attn_qkv_matmul);
+
         /* 5. RoPE on Q and K */
         int half = hd / 2;
         const int32_t * cos_m = p->rope_cos_mant + pos * half;
@@ -177,6 +185,8 @@ void shirley_attn_compute(
         for (int h = 0; h < n_kv; h++)
             shirley_rope_mtfp21(k_rot + h * hd, k_m + h * hd, cos_m, cos_e, sin_m, sin_e, hd);
 
+        SP_LAP(attn_rope);
+
         /* 6. Store K and V in cache — native MTFP21 per element */
         for (int i = 0; i < kv_dim; i++) {
             int idx = pos * kv_dim + i;
@@ -185,6 +195,8 @@ void shirley_attn_compute(
             p->v_cache_mant[idx] = v_m[i].mantissa;
             p->v_cache_exp[idx]  = v_m[i].exponent;
         }
+
+        SP_LAP(attn_kv_cache);
 
         /* 7. Attention: Q@K^T (chunked SIMD) → softmax → attn@V */
         int gqa_ratio = n_head / n_kv;
@@ -216,7 +228,9 @@ void shirley_attn_compute(
                 scores[t] = mtfp21_mul(dot, kqs);
             }
 
+            SP_LAP(attn_qk_dot);
             shirley_softmax_mtfp21(scores, scores, kv_len);
+            SP_LAP(attn_softmax);
 
             /* attn@V: weighted sum of V vectors.
              * For each head dim d: out[d] = Σ_t scores[t] × V[t][d]
@@ -243,6 +257,8 @@ void shirley_attn_compute(
             }
         }
 
+        SP_LAP(attn_av);
+
         /* 8. attn_sub_norm (SIMD) + wo matmul (sign_epi16) */
         {
             int32_t ao_m[n]; int8_t ao_e[n]; /* VLA */
@@ -264,12 +280,15 @@ void shirley_attn_compute(
             shirley_gemv_mtfp16(wo_out, wo_mant, wo_exp, p->wo_data, n, n,
                 p->wo_wscale * p->wo_lscale);
 
+            SP_LAP(attn_sub_norm_wo);
             /* 9. Residual ADD + convert to float */
             for (int i = 0; i < n; i++) {
                 mtfp21_t residual = mtfp21_from_float(input[i]);
                 out_tok[i] = mtfp21_to_float(mtfp21_add(wo_out[i], residual));
             }
+            SP_LAP(attn_residual);
         }
+        SP_TOKEN();
     }
 
     p->kv_pos += n_tokens;
