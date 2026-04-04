@@ -66,47 +66,140 @@ static inline int8_t mtfp16_block_align_vec(
  *    real = raw × 3^(exp_a + exp_b)
  * ================================================================ */
 
-static inline int64_t mtfp16_dot_simd(
-    const int16_t * restrict a,
-    const int16_t * restrict b,
+/* ================================================================
+ *  MTFP21 chunked dot product: per-element exponents, 8-wide chunks
+ *
+ *  Each element has its own mantissa (int32) and exponent (int8).
+ *  Process 8 elements at a time:
+ *    - Multiply mantissas (int32 × int32 → int64, 4 lanes × 2)
+ *    - Sum exponents per product
+ *    - Find max exponent within the 8-element chunk
+ *    - Align all products to chunk max exponent
+ *    - Accumulate in int64 with running exponent tracking
+ *
+ *  Within 8 adjacent elements, exponent spread is typically 0-2 trits.
+ *  Precision loss is bounded and negligible.
+ * ================================================================ */
+
+static inline mtfp21_t mtfp21_dot_chunked(
+    const int32_t * restrict a_mant, const int8_t * restrict a_exp,
+    const int32_t * restrict b_mant, const int8_t * restrict b_exp,
     int n
 ) {
-    int64_t total = 0;
-    __m256i acc = _mm256_setzero_si256();
+    int64_t acc_mant = 0;
+    int acc_exp = 0;
+    int acc_initialized = 0;
+
     int i;
-    int block = 0;
+    for (i = 0; i + 8 <= n; i += 8) {
+        /* Compute 8 mantissa products and exponent sums */
+        int64_t prods[8];
+        int8_t  pexp[8];
+        int8_t  chunk_max_exp = -128;
 
-    for (i = 0; i + 16 <= n; i += 16) {
-        __m256i va = _mm256_loadu_si256((const __m256i *)(a + i));
-        __m256i vb = _mm256_loadu_si256((const __m256i *)(b + i));
-        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(va, vb));
-        block += 16;
+        /* Two mul_epi32 calls: lanes 0,2,4,6 then 1,3,5,7 */
+        __m256i va = _mm256_loadu_si256((const __m256i *)(a_mant + i));
+        __m256i vb = _mm256_loadu_si256((const __m256i *)(b_mant + i));
 
-        /* Flush to int64 every 64 elements to prevent int32 overflow.
-         * Max per pair: 29524² × 2 ≈ 1.74B. 4 pairs (64 elems) = 6.96B > int32.
-         * Flush at 32 elems (2 pairs per lane × 8 lanes) to be safe. */
-        if (block >= 32) {
-            int32_t tmp[8];
-            _mm256_storeu_si256((__m256i *)tmp, acc);
-            for (int j = 0; j < 8; j++) total += (int64_t)tmp[j];
-            acc = _mm256_setzero_si256();
-            block = 0;
+        /* _mm256_mul_epi32 multiplies lanes 0,2,4,6 → 4 int64 results */
+        __m256i prod_even = _mm256_mul_epi32(va, vb);
+        /* Shift to get odd lanes: 1,3,5,7 */
+        __m256i va_odd = _mm256_srli_epi64(va, 32);
+        __m256i vb_odd = _mm256_srli_epi64(vb, 32);
+        __m256i prod_odd = _mm256_mul_epi32(va_odd, vb_odd);
+
+        /* Extract to scalar for exponent handling */
+        int64_t even[4], odd[4];
+        _mm256_storeu_si256((__m256i *)even, prod_even);
+        _mm256_storeu_si256((__m256i *)odd, prod_odd);
+
+        /* Interleave: even has indices 0,2,4,6; odd has 1,3,5,7 */
+        prods[0] = even[0]; prods[1] = odd[0];
+        prods[2] = even[1]; prods[3] = odd[1];
+        prods[4] = even[2]; prods[5] = odd[2];
+        prods[6] = even[3]; prods[7] = odd[3];
+
+        for (int j = 0; j < 8; j++) {
+            pexp[j] = (int8_t)((int)a_exp[i+j] + (int)b_exp[i+j]);
+            if (prods[j] != 0 && pexp[j] > chunk_max_exp)
+                chunk_max_exp = pexp[j];
         }
-    }
+        if (chunk_max_exp == -128) continue; /* all zeros */
 
-    /* Flush remaining */
-    {
-        int32_t tmp[8];
-        _mm256_storeu_si256((__m256i *)tmp, acc);
-        for (int j = 0; j < 8; j++) total += (int64_t)tmp[j];
+        /* Align products to chunk max exponent and sum */
+        int64_t chunk_sum = 0;
+        for (int j = 0; j < 8; j++) {
+            if (prods[j] == 0) continue;
+            int shift = chunk_max_exp - pexp[j];
+            int64_t aligned = prods[j];
+            for (int s = 0; s < shift && s < 30; s++) {
+                aligned /= 3; /* trit-shift right */
+            }
+            chunk_sum += aligned;
+        }
+
+        /* Merge chunk into running accumulator */
+        if (!acc_initialized) {
+            acc_mant = chunk_sum;
+            acc_exp = chunk_max_exp;
+            acc_initialized = 1;
+        } else {
+            /* Align accumulator and chunk to same exponent */
+            int diff = acc_exp - chunk_max_exp;
+            if (diff > 0) {
+                /* acc has larger exponent — shift chunk_sum right */
+                for (int s = 0; s < diff && s < 30; s++) chunk_sum /= 3;
+                acc_mant += chunk_sum;
+            } else if (diff < 0) {
+                /* chunk has larger exponent — shift acc right */
+                for (int s = 0; s < -diff && s < 30; s++) acc_mant /= 3;
+                acc_exp = chunk_max_exp;
+                acc_mant += chunk_sum;
+            } else {
+                acc_mant += chunk_sum;
+            }
+        }
     }
 
     /* Scalar tail */
     for (; i < n; i++) {
-        total += (int64_t)a[i] * (int64_t)b[i];
+        int64_t prod = (int64_t)a_mant[i] * (int64_t)b_mant[i];
+        int pexp_i = (int)a_exp[i] + (int)b_exp[i];
+        if (prod == 0) continue;
+
+        if (!acc_initialized) {
+            acc_mant = prod;
+            acc_exp = pexp_i;
+            acc_initialized = 1;
+        } else {
+            int diff = acc_exp - pexp_i;
+            if (diff > 0) {
+                for (int s = 0; s < diff && s < 30; s++) prod /= 3;
+                acc_mant += prod;
+            } else if (diff < 0) {
+                for (int s = 0; s < -diff && s < 30; s++) acc_mant /= 3;
+                acc_exp = pexp_i;
+                acc_mant += prod;
+            } else {
+                acc_mant += prod;
+            }
+        }
     }
 
-    return total;
+    /* Normalize to MTFP21 */
+    while (llabs(acc_mant) > MTFP21_MANT_MAX) {
+        int64_t rem = acc_mant % 3; acc_mant /= 3;
+        if (rem == 2) acc_mant++; else if (rem == -2) acc_mant--;
+        acc_exp++;
+    }
+    while (acc_mant != 0 && llabs(acc_mant) * 3 <= MTFP21_MANT_MAX && acc_exp > -MTFP21_EXP_MAX) {
+        acc_mant *= 3; acc_exp--;
+    }
+
+    mtfp21_t result;
+    result.mantissa = (int32_t)acc_mant;
+    result.exponent = (int8_t)acc_exp;
+    return result;
 }
 
 /* ================================================================

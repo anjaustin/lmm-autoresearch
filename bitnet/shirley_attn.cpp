@@ -192,38 +192,60 @@ void shirley_attn_compute(
             p->v_cache_exp[idx]  = v_m[i].exponent;
         }
 
-        /* 7. Attention: Q@K^T → softmax → attn@V (scalar MTFP21) */
+        /* 7. Attention: Q@K^T (chunked SIMD) → softmax → attn@V */
         int gqa_ratio = n_head / n_kv;
         int kv_len = pos + 1;
         mtfp21_t attn_out[n]; /* VLA */
 
+        /* Extract Q mantissa and exponent arrays per head for chunked dot */
+        int32_t q_mant_arr[n]; /* VLA */
+        int8_t  q_exp_arr[n]; /* VLA */
+        for (int i = 0; i < n; i++) {
+            q_mant_arr[i] = q_rot[i].mantissa;
+            q_exp_arr[i]  = q_rot[i].exponent;
+        }
+
         for (int h = 0; h < n_head; h++) {
             int kv_h = h / gqa_ratio;
-            mtfp21_t * qh = q_rot + h * hd;
 
             mtfp21_t scores[kv_len]; /* VLA */
             for (int t = 0; t < kv_len; t++) {
-                mtfp21_t dot = {0, 0};
-                for (int d = 0; d < hd; d++) {
-                    int kidx = t * kv_dim + kv_h * hd + d;
-                    mtfp21_t kval = {p->k_cache_mant[kidx], p->k_cache_exp[kidx]};
-                    dot = mtfp21_add(dot, mtfp21_mul(qh[d], kval));
-                }
+                /* Chunked MTFP21 dot product: per-element exponents, 8-wide SIMD */
+                const int32_t * k_mant_ptr = p->k_cache_mant + t * kv_dim + kv_h * hd;
+                const int8_t  * k_exp_ptr  = p->k_cache_exp  + t * kv_dim + kv_h * hd;
+
+                mtfp21_t dot = mtfp21_dot_chunked(
+                    q_mant_arr + h * hd, q_exp_arr + h * hd,
+                    k_mant_ptr, k_exp_ptr, hd);
+
                 mtfp21_t kqs = {p->kq_scale_mant, p->kq_scale_exp};
                 scores[t] = mtfp21_mul(dot, kqs);
             }
 
             shirley_softmax_mtfp21(scores, scores, kv_len);
 
+            /* attn@V: weighted sum of V vectors.
+             * For each head dim d: out[d] = Σ_t scores[t] × V[t][d]
+             * Extract scores into parallel arrays for chunked dot. */
+            int32_t score_mant[kv_len]; /* VLA */
+            int8_t  score_exp[kv_len]; /* VLA */
+            for (int t = 0; t < kv_len; t++) {
+                score_mant[t] = scores[t].mantissa;
+                score_exp[t]  = scores[t].exponent;
+            }
+
             mtfp21_t * out_h = attn_out + h * hd;
             for (int d = 0; d < hd; d++) {
-                mtfp21_t sum = {0, 0};
+                /* Gather V[t][d] across time positions */
+                int32_t v_d_mant[kv_len]; /* VLA */
+                int8_t  v_d_exp[kv_len]; /* VLA */
                 for (int t = 0; t < kv_len; t++) {
                     int vidx = t * kv_dim + kv_h * hd + d;
-                    mtfp21_t vval = {p->v_cache_mant[vidx], p->v_cache_exp[vidx]};
-                    sum = mtfp21_add(sum, mtfp21_mul(scores[t], vval));
+                    v_d_mant[t] = p->v_cache_mant[vidx];
+                    v_d_exp[t]  = p->v_cache_exp[vidx];
                 }
-                out_h[d] = sum;
+                out_h[d] = mtfp21_dot_chunked(score_mant, score_exp,
+                                               v_d_mant, v_d_exp, kv_len);
             }
         }
 
