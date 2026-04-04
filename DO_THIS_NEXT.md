@@ -30,11 +30,16 @@ Same base-3 exponent everywhere. The geometric coordinate is invariant across wi
 ### What's Done
 
 - **MTFP arithmetic:** 109/109 tests (add, mul, div, rsqrt, exp, softmax, cmp)
-- **MTFP16 matmul kernel:** `shirley_mtfp16_matmul.h` — sign_epi16 × 2-bit packed ternary, 6/6 tests, statistical validation (avg error 8e-05)
-- **Attention custom op:** attn_norm + QKV (sign_epi16) + RoPE (CONST) + Q@K^T (MTFP21) + softmax (EXP) + attn@V (MTFP21) + sub_norm + wo (sign_epi16) + residual
-- **FFN custom op:** ffn_norm + gate/up (sign_epi16) + ReLU² + mul + sub_norm + down (sign_epi16) + residual
-- **Output norm:** MTFP21 RMSNorm
-- **Generation:** Coherent, factually accurate across diverse prompts
+- **MTFP16 matmul kernel:** `shirley_mtfp16_matmul.h` — sign_epi16 × 2-bit packed ternary, 6/6 tests
+- **Chunked MTFP21 dot product:** `mtfp21_dot_chunked` — 8-wide SIMD with per-element exponents
+- **SIMD RMSNorm:** `mtfp21_rmsnorm_simd` — chunked sum-of-squares + vectorized scale×gamma
+- **SIMD FFN trivials:** ReLU (max_epi16, 16 lanes), Square (mullo_epi32, 8 lanes)
+- **Attention custom op:** attn_norm (SIMD) + QKV (sign_epi16) + RoPE (CONST) + Q@K^T (chunked SIMD) + softmax (EXP) + attn@V (chunked SIMD) + sub_norm (SIMD) + wo (sign_epi16) + residual
+- **FFN custom op:** ffn_norm (SIMD) + gate/up (sign_epi16) + ReLU² (SIMD) + mul + sub_norm (SIMD) + down (sign_epi16) + residual
+- **All constants precomputed:** gamma weights, eps, kq_scale, RoPE tables — all MTFP21 at load time
+- **Native MTFP21 KV cache:** per-element mantissa + exponent, zero float conversion
+- **Generation:** 7/7 diverse prompts coherent and factually accurate. A/B vs baseline: equivalent quality
+- **Speed:** 3.82 tok/s (up from 2.14 baseline, +79% from SIMD + float elimination)
 - **Geometric insight:** Numbers are positions. Exponents are coordinates. Documented.
 
 ### What Remains: Float32 Remediation
@@ -85,3 +90,5 @@ Two float32 operations remain. Both are at the model boundary between discrete t
 6. **Don't accommodate float32, replace it.** Every retreat to float made the architecture worse.
 7. **Numbers are positions.** The exponent is a coordinate. The graph is the geometry.
 8. **The LMM finds what you're not seeing.** The third vectorization approach (adaptive width) came from the manifold, not from incremental engineering.
+9. **Chunked SIMD beats block alignment for wide-spread data.** Block exponent alignment works post-normalization (tight spread). For post-RoPE attention data (wide spread), chunked 8-element alignment with per-element exponents preserves precision that global block alignment destroys.
+10. **No scalar in the hot path.** Every bulk loop is SIMD. Scalar only for irreducible operations (one rsqrt, one exp LUT lookup).

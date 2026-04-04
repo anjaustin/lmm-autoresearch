@@ -387,9 +387,9 @@ Commits: bc23f57 (Option D validation), 843eef4 (Phase 1 integration).
 
 Entire FFN block as one `ggml_map_custom1`. Matmuls use MTFP16 via sign_epi16 (zero float conversion). Between-matmul ops (ReLU, square, multiply) stay MTFP21 for full precision. Commit ba5deaf.
 
-### Phases 3-5: Attention custom op — COMPLETE
+### Phases 3-5: Attention custom op — COMPLETE + SIMD
 
-Entire attention block as one `ggml_map_custom1`. QKV + wo matmuls use MTFP16 sign_epi16. RoPE uses precomputed CONST sin/cos tables (MTFP21 multiply + add). Q@K^T and attn@V are MTFP21 dot products. Softmax uses mtfp21_exp (the EXP prime). Commit ba5deaf.
+Entire attention block as one `ggml_map_custom1`. QKV + wo matmuls use MTFP16 sign_epi16 (16 lanes). RoPE uses precomputed CONST sin/cos tables (native MTFP21). Q@K^T and attn@V use `mtfp21_dot_chunked` (8-wide SIMD with per-element exponents). RMSNorms use `mtfp21_rmsnorm_simd`. Softmax uses mtfp21_exp (EXP prime, scalar LUT). KV cache stores native MTFP21 per element. No scalar loops in the hot path. Speed: 3.82 tok/s (+79% from baseline). Commits: ba5deaf (initial), ca3ac19 (SIMD).
 
 ### Phase 6: Embedding + LM head
 

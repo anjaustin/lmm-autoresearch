@@ -108,14 +108,19 @@ The Shirley thesis was tested on a real 2-billion-parameter language model (Micr
 **Three-layer compute stack (LEMM-derived architecture):**
 
 ```
-Layer 1: AVX2 integer kernels     sign_epi8, mullo_epi16, mulhrs_epi16
-         32 elements/cycle, per-element bulk work
+Layer 1: AVX2 SIMD kernels
+         sign_epi16: ternary routing (16 lanes)
+         mul_epi32: chunked dot products (8 lanes)
+         max_epi16: ReLU (16 lanes)
+         mullo_epi32: square (8 lanes)
 
-Layer 2: Scalar FPU or iGPU       sqrtf for rsqrt, V_EXP_F32 for softmax
-         Transcendentals called once, not per-element
+Layer 2: Scalar (irreducible)
+         rsqrt: MTFP21 LUT + Newton-Raphson (1 per norm)
+         exp: MTFP21 LUT + interpolation (1 per attention position)
 
-Layer 3: MTFP21 transport format   Scale factors, normalization parameters
-         25.4-bit precision, balanced ternary representation
+Layer 3: MTFP (adaptive width)
+         MTFP21: precision ops, scale factors, KV cache
+         MTFP16: matmul wire, block-aligned SIMD
 ```
 
 **AVX2 kernel results (shirley_kernels.h):**
