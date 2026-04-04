@@ -135,20 +135,14 @@ void shirley_attn_compute(
         mtfp21_t inp_m[n]; /* VLA */
         for (int i = 0; i < n; i++) inp_m[i] = mtfp21_from_float(input[i]);
 
-        /* 0. attn_norm: MTFP21 RMSNorm */
+        /* 0. attn_norm: SIMD RMSNorm */
         {
-            mtfp21_t sum_sq = {0, 0};
-            for (int i = 0; i < n; i++)
-                sum_sq = mtfp21_add(sum_sq, mtfp21_mul(inp_m[i], inp_m[i]));
-            mtfp21_t mean = mtfp21_div_scalar(sum_sq, n);
-            mtfp21_t scale = mtfp21_rsqrt(mtfp21_add(mean, (mtfp21_t){p->eps_mant, p->eps_exp}));
-            for (int i = 0; i < n; i++) {
-                inp_m[i] = mtfp21_mul(inp_m[i], scale);
-                if (p->attn_norm_gamma_mant) {
-                    mtfp21_t g = {p->attn_norm_gamma_mant[i], p->attn_norm_gamma_exp[i]};
-                    inp_m[i] = mtfp21_mul(inp_m[i], g);
-                }
-            }
+            int32_t m[n]; int8_t e[n]; /* VLA — parallel arrays */
+            for (int i = 0; i < n; i++) { m[i] = inp_m[i].mantissa; e[i] = inp_m[i].exponent; }
+            mtfp21_rmsnorm_simd(m, e, m, e,
+                p->attn_norm_gamma_mant, p->attn_norm_gamma_exp,
+                n, p->eps_mant, p->eps_exp);
+            for (int i = 0; i < n; i++) { inp_m[i].mantissa = m[i]; inp_m[i].exponent = e[i]; }
         }
 
         /* 1. Block-align for QKV matmuls (MTFP21 → MTFP16) */
@@ -249,22 +243,18 @@ void shirley_attn_compute(
             }
         }
 
-        /* 8. attn_sub_norm + wo matmul (MTFP16, sign_epi16) */
+        /* 8. attn_sub_norm (SIMD) + wo matmul (sign_epi16) */
         {
-            mtfp21_t sum_sq = {0, 0};
-            for (int i = 0; i < n; i++)
-                sum_sq = mtfp21_add(sum_sq, mtfp21_mul(attn_out[i], attn_out[i]));
-            mtfp21_t mean = mtfp21_div_scalar(sum_sq, n);
-            mtfp21_t scale = mtfp21_rsqrt(mtfp21_add(mean, (mtfp21_t){p->eps_mant, p->eps_exp}));
+            int32_t ao_m[n]; int8_t ao_e[n]; /* VLA */
+            for (int i = 0; i < n; i++) { ao_m[i] = attn_out[i].mantissa; ao_e[i] = attn_out[i].exponent; }
+
+            int32_t nm[n]; int8_t ne_arr[n]; /* VLA — normed output */
+            mtfp21_rmsnorm_simd(nm, ne_arr, ao_m, ao_e,
+                p->sub_norm_gamma_mant, p->sub_norm_gamma_exp,
+                n, p->eps_mant, p->eps_exp);
 
             mtfp21_t normed[n]; /* VLA */
-            for (int i = 0; i < n; i++) {
-                normed[i] = mtfp21_mul(attn_out[i], scale);
-                if (p->sub_norm_gamma_mant) {
-                    mtfp21_t g = {p->sub_norm_gamma_mant[i], p->sub_norm_gamma_exp[i]};
-                    normed[i] = mtfp21_mul(normed[i], g);
-                }
-            }
+            for (int i = 0; i < n; i++) { normed[i].mantissa = nm[i]; normed[i].exponent = ne_arr[i]; }
 
             /* wo matmul: MTFP16 × ternary → MTFP21 */
             int16_t wo_mant[n]; /* VLA */

@@ -352,4 +352,75 @@ static inline int64_t mtfp16_sum_of_squares(
     return total;
 }
 
+/* ================================================================
+ *  SIMD RMSNorm: chunked sum-of-squares + vectorized scale×gamma
+ *
+ *  Input: MTFP21 parallel arrays (mantissa + exponent)
+ *  Output: MTFP21 parallel arrays (normalized, gamma-applied)
+ *  Only the rsqrt is scalar. Everything else is SIMD.
+ * ================================================================ */
+
+static inline void mtfp21_rmsnorm_simd(
+    int32_t * dst_mant, int8_t * dst_exp,           /* output */
+    const int32_t * src_mant, const int8_t * src_exp, /* input */
+    const int32_t * gamma_mant, const int8_t * gamma_exp, /* gamma (NULL to skip) */
+    int n, int32_t eps_mant, int8_t eps_exp
+) {
+    /* 1. Sum of squares — chunked SIMD */
+    mtfp21_t sum_sq = mtfp21_dot_chunked(src_mant, src_exp, src_mant, src_exp, n);
+
+    /* 2. rsqrt — one scalar (irreducible) */
+    mtfp21_t mean = mtfp21_div_scalar(sum_sq, n);
+    mtfp21_t scale = mtfp21_rsqrt(mtfp21_add(mean, (mtfp21_t){eps_mant, eps_exp}));
+
+    /* 3. Per-element scale × gamma — SIMD 8-wide */
+    int32_t sm = scale.mantissa;
+    int i;
+
+    for (i = 0; i + 8 <= n; i += 8) {
+        __m256i vm = _mm256_loadu_si256((const __m256i *)(src_mant + i));
+        __m256i vs = _mm256_set1_epi32(sm);
+
+        __m256i prod_even = _mm256_mul_epi32(vm, vs);
+        __m256i vm_odd = _mm256_srli_epi64(vm, 32);
+        __m256i prod_odd = _mm256_mul_epi32(vm_odd, vs);
+
+        int64_t even[4], odd[4];
+        _mm256_storeu_si256((__m256i *)even, prod_even);
+        _mm256_storeu_si256((__m256i *)odd, prod_odd);
+
+        int64_t prods[8];
+        prods[0] = even[0]; prods[1] = odd[0];
+        prods[2] = even[1]; prods[3] = odd[1];
+        prods[4] = even[2]; prods[5] = odd[2];
+        prods[6] = even[3]; prods[7] = odd[3];
+
+        for (int j = 0; j < 8; j++) {
+            int exp = (int)src_exp[i+j] + (int)scale.exponent;
+            int64_t p = prods[j];
+            while (llabs(p) > MTFP21_MANT_MAX) { p /= 3; exp++; }
+            while (p != 0 && llabs(p) * 3 <= MTFP21_MANT_MAX && exp > -MTFP21_EXP_MAX) { p *= 3; exp--; }
+
+            if (gamma_mant) {
+                /* Multiply by gamma */
+                int64_t gp = p * (int64_t)gamma_mant[i+j];
+                int ge = exp + (int)gamma_exp[i+j];
+                while (llabs(gp) > MTFP21_MANT_MAX) { gp /= 3; ge++; }
+                while (gp != 0 && llabs(gp) * 3 <= MTFP21_MANT_MAX && ge > -MTFP21_EXP_MAX) { gp *= 3; ge--; }
+                dst_mant[i+j] = (int32_t)gp;
+                dst_exp[i+j] = (int8_t)ge;
+            } else {
+                dst_mant[i+j] = (int32_t)p;
+                dst_exp[i+j] = (int8_t)exp;
+            }
+        }
+    }
+    for (; i < n; i++) {
+        mtfp21_t v = mtfp21_mul((mtfp21_t){src_mant[i], src_exp[i]}, scale);
+        if (gamma_mant) v = mtfp21_mul(v, (mtfp21_t){gamma_mant[i], gamma_exp[i]});
+        dst_mant[i] = v.mantissa;
+        dst_exp[i] = v.exponent;
+    }
+}
+
 #endif /* SHIRLEY_MTFP16_OPS_H */

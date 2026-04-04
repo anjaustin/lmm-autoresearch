@@ -90,14 +90,64 @@ static int8_t mtfp21_rmsnorm_to_mtfp16(
     const int32_t * gamma_mant, const int8_t * gamma_exp,
     int n, int32_t eps_mant, int8_t eps_exp
 ) {
-    mtfp21_t sum_sq = {0, 0};
-    for (int i = 0; i < n; i++)
-        sum_sq = mtfp21_add(sum_sq, mtfp21_mul(src[i], src[i]));
+    /* 1. Sum of squares — chunked SIMD dot product: src · src */
+    int32_t s_mant[n]; /* VLA */
+    int8_t  s_exp[n];  /* VLA */
+    for (int i = 0; i < n; i++) { s_mant[i] = src[i].mantissa; s_exp[i] = src[i].exponent; }
+    mtfp21_t sum_sq = mtfp21_dot_chunked(s_mant, s_exp, s_mant, s_exp, n);
+
+    /* 2. rsqrt — one scalar (irreducible) */
     mtfp21_t mean = mtfp21_div_scalar(sum_sq, n);
     mtfp21_t scale = mtfp21_rsqrt(mtfp21_add(mean, (mtfp21_t){eps_mant, eps_exp}));
 
+    /* 3. Per-element scale × gamma — SIMD multiply
+     * scale is a scalar broadcast. Multiply all mantissas by scale.mantissa,
+     * add scale.exponent to all exponents. Then multiply by gamma. */
+    int32_t scale_m = scale.mantissa;
+    int8_t  scale_e = scale.exponent;
+
     mtfp21_t normed[n]; /* VLA */
-    for (int i = 0; i < n; i++) {
+    int i;
+    for (i = 0; i + 8 <= n; i += 8) {
+        /* Load 8 source mantissas */
+        __m256i vm = _mm256_loadu_si256((const __m256i *)(s_mant + i));
+        /* Multiply by scale mantissa: int32 × int32 → int64 (need 4-lane) */
+        __m256i vs = _mm256_set1_epi32(scale_m);
+        /* Use mul_epi32 for lanes 0,2,4,6 then shift for 1,3,5,7 */
+        __m256i prod_even = _mm256_mul_epi32(vm, vs);
+        __m256i vm_odd = _mm256_srli_epi64(vm, 32);
+        __m256i prod_odd = _mm256_mul_epi32(vm_odd, vs);
+
+        int64_t prods[8];
+        int64_t even[4], odd[4];
+        _mm256_storeu_si256((__m256i *)even, prod_even);
+        _mm256_storeu_si256((__m256i *)odd, prod_odd);
+        prods[0] = even[0]; prods[1] = odd[0];
+        prods[2] = even[1]; prods[3] = odd[1];
+        prods[4] = even[2]; prods[5] = odd[2];
+        prods[6] = even[3]; prods[7] = odd[3];
+
+        for (int j = 0; j < 8; j++) {
+            int exp = (int)s_exp[i+j] + (int)scale_e;
+            /* Normalize product to MTFP21 range */
+            int64_t p = prods[j];
+            while (llabs(p) > MTFP21_MANT_MAX) {
+                p /= 3; exp++;
+            }
+            while (p != 0 && llabs(p) * 3 <= MTFP21_MANT_MAX && exp > -MTFP21_EXP_MAX) {
+                p *= 3; exp--;
+            }
+            normed[i+j].mantissa = (int32_t)p;
+            normed[i+j].exponent = (int8_t)exp;
+
+            if (gamma_mant) {
+                mtfp21_t g = {gamma_mant[i+j], gamma_exp[i+j]};
+                normed[i+j] = mtfp21_mul(normed[i+j], g);
+            }
+        }
+    }
+    /* Scalar tail */
+    for (; i < n; i++) {
         normed[i] = mtfp21_mul(src[i], scale);
         if (gamma_mant) {
             mtfp21_t g = {gamma_mant[i], gamma_exp[i]};
