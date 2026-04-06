@@ -274,6 +274,7 @@ void shirley_ffn_compute(
             out_tok[i] = mtfp21_to_float(result);
         }
         SP_LAP(ffn_residual);
+        SP_TOKEN();
     }
 
     static int logged = 0;

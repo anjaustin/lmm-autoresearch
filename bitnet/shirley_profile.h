@@ -68,6 +68,6 @@ static inline void _shirley_profile_print(void) {
 
 #define SP_START double _t0 = _shirley_now()
 #define SP_LAP(field) do { double _t1 = _shirley_now(); _sp.field += (_t1 - _t0); _t0 = _t1; } while(0)
-#define SP_TOKEN() do { _sp.tokens++; if (_sp.tokens == 8) _shirley_profile_print(); } while(0)
+#define SP_TOKEN() do { _sp.tokens++; if (_sp.tokens == 10) _shirley_profile_print(); } while(0)
 
 #endif
