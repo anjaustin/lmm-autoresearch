@@ -15465,11 +15465,15 @@ struct llm_build_context {
 
         for (int il = 0; il < n_layer; ++il) {
 
-            // self-attention — Shirley MTFP21 custom op
-            // Includes: attn_norm + QKV + RoPE + attention + sub_norm + wo + scale + RESIDUAL ADD
-            cur = ggml_map_custom1(ctx0, inpL,
-                shirley_attn_compute, 1,
-                &shirley_attn_layer_params[il]);
+            // self-attention — Shirley split-node: 5 ops, threaded QKV + wo
+            {
+                struct shirley_attn_params * ap = &shirley_attn_layer_params[il];
+                cur = ggml_map_custom1(ctx0, inpL, shirley_attn_prep, 1, ap);
+                cur = ggml_map_custom1_inplace(ctx0, cur, shirley_attn_qkv, GGML_N_TASKS_MAX, ap);
+                cur = ggml_map_custom1_inplace(ctx0, cur, shirley_attn_body, 1, ap);
+                cur = ggml_map_custom1_inplace(ctx0, cur, shirley_attn_wo, GGML_N_TASKS_MAX, ap);
+                cur = ggml_map_custom1_inplace(ctx0, cur, shirley_attn_finish, 1, ap);
+            }
             cb(cur, "ffn_inp", il);
 
             if (il == n_layer - 1) {

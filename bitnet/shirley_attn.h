@@ -70,15 +70,16 @@ struct shirley_attn_params {
     /* Pre-allocated workspace */
     float * w_raw;       /* [max(n_embd, n_head * max_seq_len)] */
 
-    /* Threading workspace */
-    volatile int mt_phase;
-    volatile int mt_threads_done;
-    int16_t * mt_act;         /* shared block-aligned activations */
+    /* Split-node shared state: written by one node, read by the next */
+    int16_t * mt_act;         /* block-aligned activations (prep → qkv) */
     int8_t    mt_bexp;
-    void    * mt_qkv;         /* mtfp21_t[n_embd + kv_dim + kv_dim] for Q,K,V */
-    int16_t * mt_wo_act;      /* block-aligned for wo matmul */
+    void    * mt_qkv;         /* mtfp21_t[n_embd + kv_dim + kv_dim] (qkv → body) */
+    int16_t * mt_wo_act;      /* block-aligned for wo (body → wo) */
     int8_t    mt_wo_bexp;
-    void    * mt_wo_out;      /* mtfp21_t[n_embd] */
+    void    * mt_wo_out;      /* mtfp21_t[n_embd] (wo → finish) */
+    const float * mt_input;   /* current token's ggml input ptr (prep → finish) */
+    float *   mt_output;      /* current token's ggml output ptr (finish writes) */
+    int       mt_pos;         /* current position for RoPE + cache */
 
     int ready;
 };
@@ -93,11 +94,13 @@ extern "C" {
  *
  * For single-token generation: uses KV cache.
  * For prompt eval: processes all tokens, fills cache. */
-void shirley_attn_compute(
-    struct ggml_tensor * dst,
-    const struct ggml_tensor * a,
-    int ith, int nth,
-    void * userdata);
+/* Split-node attention: 5 callbacks, each a separate ggml graph node.
+ * ggml manages thread barriers between nodes. No spin-waits. */
+void shirley_attn_prep(struct ggml_tensor * dst, const struct ggml_tensor * a, int ith, int nth, void * userdata);
+void shirley_attn_qkv(struct ggml_tensor * dst, const struct ggml_tensor * a, int ith, int nth, void * userdata);
+void shirley_attn_body(struct ggml_tensor * dst, const struct ggml_tensor * a, int ith, int nth, void * userdata);
+void shirley_attn_wo(struct ggml_tensor * dst, const struct ggml_tensor * a, int ith, int nth, void * userdata);
+void shirley_attn_finish(struct ggml_tensor * dst, const struct ggml_tensor * a, int ith, int nth, void * userdata);
 
 /* Initialize per-layer params from model weights.
  * Also precomputes RoPE sin/cos tables and allocates KV cache. */
