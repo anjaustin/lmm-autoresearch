@@ -389,7 +389,7 @@ Entire FFN block as one `ggml_map_custom1`. Matmuls use MTFP16 via sign_epi16 (z
 
 ### Phases 3-5: Attention custom op — COMPLETE + SIMD
 
-Entire attention block as one `ggml_map_custom1`. QKV + wo matmuls use MTFP16 sign_epi16 (16 lanes). RoPE uses precomputed CONST sin/cos tables (native MTFP21). Q@K^T and attn@V use `mtfp21_dot_chunked` (8-wide SIMD with per-element exponents). RMSNorms use `mtfp21_rmsnorm_simd`. Softmax uses mtfp21_exp (EXP prime, scalar LUT). KV cache stores native MTFP21 per element. No scalar loops in the hot path. Speed: 3.82 tok/s (+79% from baseline). Commits: ba5deaf (initial), ca3ac19 (SIMD).
+Attention: single-threaded custom op with QKV+wo via sign_epi16, RoPE via CONST tables, Q@K^T and attn@V via mtfp21_dot_chunked, softmax via mtfp21_exp. FFN: multi-threaded matmuls (gate+up, down), native MTFP21 trivials (relu, square, elem_mul — no format conversion). RMSNorms via mtfp21_rmsnorm_simd. KV cache native MTFP21. Speed: 4.57 tok/s (+114% from baseline). Split-node attention threading attempted (85a616e) but regressed — retracted.
 
 ### Phase 6: Embedding + LM head
 

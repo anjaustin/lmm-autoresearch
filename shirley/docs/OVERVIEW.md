@@ -108,19 +108,19 @@ The Shirley thesis was tested on a real 2-billion-parameter language model (Micr
 **Three-layer compute stack (LEMM-derived architecture):**
 
 ```
-Layer 1: AVX2 SIMD kernels
-         sign_epi16: ternary routing (16 lanes)
-         mul_epi32: chunked dot products (8 lanes)
-         max_epi16: ReLU (16 lanes)
-         mullo_epi32: square (8 lanes)
+Layer 1: AVX2 SIMD
+         sign_epi16: ternary routing at matmul wire (16 lanes)
+         mul_epi32: chunked dot products for attention (8 lanes)
+         rmsnorm_simd: sum-of-squares + vectorized scale (8 lanes)
 
-Layer 2: Scalar (irreducible)
-         rsqrt: MTFP21 LUT + Newton-Raphson (1 per norm)
-         exp: MTFP21 LUT + interpolation (1 per attention position)
+Layer 2: Native MTFP21
+         Between-matmul ops: mtfp21_relu, mtfp21_square, mtfp21_elem_mul
+         Scalar precision: rsqrt (LUT+NR), exp (LUT), softmax, RoPE
+         No format conversion. Data stays MTFP21 between matmuls.
 
-Layer 3: MTFP (adaptive width)
-         MTFP21: precision ops, scale factors, KV cache
-         MTFP16: matmul wire, block-aligned SIMD
+Layer 3: Matmul wire (MTFP16)
+         Block-aligned int16 mantissas for sign_epi16
+         Exists ONLY at the matmul boundary (rmsnorm → block-align → matmul)
 ```
 
 **AVX2 kernel results (shirley_kernels.h):**
