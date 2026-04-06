@@ -181,7 +181,11 @@ static void mtfp21_elem_mul(mtfp21_t * dst, const mtfp21_t * a, const mtfp21_t *
  *  FFN compute — adaptive-width MTFP, zero float in matmul path
  * ================================================================ */
 
-/* shirley_gemv_mtfp16_part is now in shirley_mtfp16_matmul.h */
+/* Original ternary matmul kernel for int8 path (32 lanes) */
+extern "C" {
+void ggml_gemv_i2_i8_s(int n, float * s, size_t bs,
+    const void * vx, const void * vy, int nr, int nc);
+}
 
 extern "C"
 void shirley_ffn_compute(
@@ -202,124 +206,118 @@ void shirley_ffn_compute(
 
         SP_START; /* starts timer for all threads, only thread 0 uses SP_LAP */
 
-        /* ---- PHASE 0: Sequential prep (thread 0 only) ---- */
+        /* ---- PHASE 0: RMSNorm → int8 via shirley_rmsnorm_quantize (thread 0) ---- */
         if (ith == 0) {
-
-            mtfp21_t inp_m[n]; /* VLA */
-            for (int i = 0; i < n; i++) inp_m[i] = mtfp21_from_float(input[i]);
-            SP_LAP(ffn_input_conv);
-
-            /* Store inp_m for residual later (in output buffer temporarily) */
-            /* We'll read input[] again for residual at the end */
-
-            p->mt_bexp = mtfp21_rmsnorm_to_mtfp16(
-                p->mt_act, inp_m, p->ffn_norm_gamma_mant, p->ffn_norm_gamma_exp, n, p->eps_mant, p->eps_exp);
+            shirley_rmsnorm_quantize(
+                (int8_t *)p->w_act, input, p->ffn_norm_gamma_f32, n, p->eps, 80);
             SP_LAP(ffn_norm);
-
-            __atomic_store_n(&p->mt_phase, 1, __ATOMIC_RELEASE); /* signal: gate+up ready */
+            __atomic_store_n(&p->mt_phase, 1, __ATOMIC_RELEASE);
         } else {
-            while (__atomic_load_n(&p->mt_phase, __ATOMIC_ACQUIRE) < 1) { /* spin */ }
+            while (__atomic_load_n(&p->mt_phase, __ATOMIC_ACQUIRE) < 1) {}
         }
 
-        /* ---- PHASE 1: Gate + Up matmul — raw int32 output (ALL threads) ---- */
-        shirley_gemv_mtfp16_part_raw(p->mt_gate_raw, p->mt_act,
-            p->gate_data, n, n_ff, ith, nth);
-        shirley_gemv_mtfp16_part_raw(p->mt_up_raw, p->mt_act,
-            p->up_data, n, n_ff, ith, nth);
+        /* ---- PHASE 1: Gate + Up matmul — sign_epi8, 32 lanes (ALL threads) ---- */
+        {
+            int rows_per = (n_ff + nth - 1) / nth;
+            int r0 = ith * rows_per;
+            int r1 = r0 + rows_per; if (r1 > n_ff) r1 = n_ff;
+            if (r0 < r1) {
+                /* Gate: our partition */
+                float gate_tmp[r1 - r0]; /* VLA */
+                ggml_gemv_i2_i8_s(n, gate_tmp, r1 - r0,
+                    (const char *)p->gate_data + (int64_t)r0 * (n / 4),
+                    p->w_act, 1, r1 - r0);
+                float gate_cs = p->gate_wscale * p->gate_lscale;
+                for (int i = 0; i < r1 - r0; i++) {
+                    p->mt_gate_raw[r0 + i] = (int32_t)(gate_tmp[i] * gate_cs);
+                }
+                /* Up: our partition */
+                float up_tmp[r1 - r0]; /* VLA */
+                ggml_gemv_i2_i8_s(n, up_tmp, r1 - r0,
+                    (const char *)p->up_data + (int64_t)r0 * (n / 4),
+                    p->w_act, 1, r1 - r0);
+                float up_cs = p->up_wscale * p->up_lscale;
+                for (int i = 0; i < r1 - r0; i++) {
+                    p->mt_up_raw[r0 + i] = (int32_t)(up_tmp[i] * up_cs);
+                }
+            }
+        }
 
         __atomic_fetch_add(&p->mt_threads_done, 1, __ATOMIC_ACQ_REL);
         if (ith == 0) {
-            while (__atomic_load_n(&p->mt_threads_done, __ATOMIC_ACQUIRE) < nth) { /* spin */ }
+            while (__atomic_load_n(&p->mt_threads_done, __ATOMIC_ACQUIRE) < nth) {}
             __atomic_store_n(&p->mt_threads_done, 0, __ATOMIC_RELEASE);
             SP_LAP(ffn_gate_up);
 
-            /* ---- PHASE 2: Fused trivials — deferred normalization ----
-             * raw int32 gate/up → relu(sign check) → square(int64) → multiply(int64)
-             * → ONE normalization to MTFP21. No intermediate trit-shift loops.
-             *
-             * Weight scales applied as MTFP21 multiply after normalization. */
-            float gate_ws = p->gate_wscale * p->gate_lscale;
-            float up_ws   = p->up_wscale * p->up_lscale;
-            /* Combined scale for the fused result:
-             * real = gate_raw × gate_ws × gate_ws × up_raw × up_ws / act_scale³
-             * (gate_ws appears twice because of square)
-             * But we track exponents: block_exp contributes to both gate and up.
-             * gate_real = gate_raw × 3^block_exp × gate_ws
-             * gate²_real = gate_raw² × 3^(2×block_exp) × gate_ws²
-             * result_real = gate²_real × up_real = gate_raw² × up_raw × 3^(3×block_exp) × gate_ws² × up_ws */
-            mtfp21_t combined_ws = mtfp21_mul(
-                mtfp21_mul(mtfp21_from_float(gate_ws), mtfp21_from_float(gate_ws)),
-                mtfp21_from_float(up_ws));
-            int combined_exp = (int)p->mt_bexp * 3; /* 3× because gate² × up uses block_exp three times */
+            /* ---- PHASE 2: Trivials — AVX2 kernels ---- */
+            /* Rescale gate raw → int8 */
+            shirley_rescale_i32_to_i8(p->mt_gate_i8, p->mt_gate_raw, n_ff, 80);
+            /* Rescale up raw → int8 */
+            shirley_rescale_i32_to_i8(p->mt_up_i8, p->mt_up_raw, n_ff, 80);
 
-            mtfp21_t ffn_out[n_ff]; /* VLA */
+            /* ReLU: 32 lanes, one AVX2 instruction */
+            shirley_relu_i8(p->mt_gate_i8, p->mt_gate_i8, n_ff);
+
+            /* Square: int8 → int16, AVX2 */
+            int16_t sq[n_ff]; /* VLA */
+            shirley_square_i8_to_i16(sq, p->mt_gate_i8, n_ff);
+
+            /* gate² × up: int16 × int8 → int16, then requantize to int8 */
+            int16_t prod[n_ff]; /* VLA */
             for (int i = 0; i < n_ff; i++) {
-                int32_t g = p->mt_gate_raw[i];
-                int32_t u = p->mt_up_raw[i];
-
-                /* ReLU: check sign. No normalization. */
-                if (g <= 0) { ffn_out[i] = (mtfp21_t){0, 0}; continue; }
-
-                /* Square × Up: int32 × int32 → int64, then × int32 → int64
-                 * g² × u. Max: 75M² × 75M = 4.2e23. Fits int64 (max 9.2e18)...
-                 * NO — 75M² = 5.6e15, × 75M = 4.2e23. Does NOT fit int64 (max 9.2e18).
-                 * Need to scale down before multiplying. */
-                int64_t g_sq = (int64_t)g * (int64_t)g;
-                /* Normalize g_sq to fit before multiplying by u */
-                int extra_exp = 0;
-                while (llabs(g_sq) > 2000000000LL) { /* keep within safe int64 range for × u */
-                    g_sq /= 3;
-                    extra_exp++;
-                }
-                int64_t result = g_sq * (int64_t)u;
-
-                /* Normalize to MTFP21 — ONE normalization for the entire trivials */
-                int exp = combined_exp + extra_exp;
-                while (llabs(result) > MTFP21_MANT_MAX) {
-                    int64_t rem = result % 3; result /= 3;
-                    if (rem == 2) result++; else if (rem == -2) result--;
-                    exp++;
-                }
-                while (result != 0 && llabs(result) * 3 <= MTFP21_MANT_MAX && exp > -MTFP21_EXP_MAX) {
-                    result *= 3; exp--;
-                }
-
-                mtfp21_t r; r.mantissa = (int32_t)result; r.exponent = (int8_t)exp;
-                ffn_out[i] = mtfp21_mul(r, combined_ws);
+                int32_t p32 = (int32_t)sq[i] * (int32_t)p->mt_up_i8[i];
+                /* Scale down to int16 range. Max: 6400 × 80 = 512000. >>7 = 4000. */
+                prod[i] = (int16_t)(p32 >> 7);
             }
+            shirley_requantize_i16_to_i8(p->mt_trivials_i8, prod, n_ff, 80);
             SP_LAP(ffn_trivials);
 
-            /* ---- PHASE 3: Sub-norm (thread 0 only) ---- */
-            p->mt_sub_bexp = mtfp21_rmsnorm_to_mtfp16(
-                p->mt_sub_act, ffn_out, p->ffn_sub_norm_gamma_mant, p->ffn_sub_norm_gamma_exp, n_ff, p->eps_mant, p->eps_exp);
+            /* ---- PHASE 3: Sub-norm — shirley_rmsnorm_ternary, 417ns ---- */
+            int8_t sub_out[n_ff]; /* VLA */
+            shirley_rmsnorm_ternary(sub_out, p->mt_trivials_i8,
+                p->ffn_sub_norm_gamma_q14, n_ff, 80);
+            memcpy(p->w_act, sub_out, n_ff);
             SP_LAP(ffn_sub_norm);
 
-            __atomic_store_n(&p->mt_phase, 3, __ATOMIC_RELEASE); /* signal: down ready */
+            __atomic_store_n(&p->mt_phase, 3, __ATOMIC_RELEASE);
         } else {
-            while (__atomic_load_n(&p->mt_phase, __ATOMIC_ACQUIRE) < 3) { /* spin */ }
+            while (__atomic_load_n(&p->mt_phase, __ATOMIC_ACQUIRE) < 3) {}
         }
 
-        /* ---- PHASE 4: Down matmul (ALL threads) ---- */
-        shirley_gemv_mtfp16_part(((mtfp21_t*)p->mt_down), p->mt_sub_act, p->mt_sub_bexp,
-            p->down_data, n_ff, n, p->down_wscale * p->down_lscale, ith, nth);
+        /* ---- PHASE 4: Down matmul — sign_epi8, 32 lanes (ALL threads) ---- */
+        {
+            int rows_per = (n + nth - 1) / nth;
+            int r0 = ith * rows_per;
+            int r1 = r0 + rows_per; if (r1 > n) r1 = n;
+            if (r0 < r1) {
+                float down_tmp[r1 - r0]; /* VLA */
+                ggml_gemv_i2_i8_s(n_ff, down_tmp, r1 - r0,
+                    (const char *)p->down_data + (int64_t)r0 * (n_ff / 4),
+                    p->w_act, 1, r1 - r0);
+                float down_cs = p->down_wscale * p->down_lscale;
+                for (int i = 0; i < r1 - r0; i++) {
+                    ((float *)p->mt_down)[r0 + i] = down_tmp[i] * down_cs;
+                }
+            }
+        }
 
         __atomic_fetch_add(&p->mt_threads_done, 1, __ATOMIC_ACQ_REL);
         if (ith == 0) {
-            while (__atomic_load_n(&p->mt_threads_done, __ATOMIC_ACQUIRE) < nth) { /* spin */ }
+            while (__atomic_load_n(&p->mt_threads_done, __ATOMIC_ACQUIRE) < nth) {}
             __atomic_store_n(&p->mt_threads_done, 0, __ATOMIC_RELEASE);
             SP_LAP(ffn_down);
 
-            /* ---- PHASE 5: Residual + output (thread 0 only) ---- */
+            /* ---- PHASE 5: Residual + output ---- */
+            float * down_f = (float *)p->mt_down;
             for (int i = 0; i < n; i++) {
-                mtfp21_t inp_i = mtfp21_from_float(input[i]);
-                out_tok[i] = mtfp21_to_float(mtfp21_add(((mtfp21_t*)p->mt_down)[i], inp_i));
+                out_tok[i] = down_f[i] + input[i];
             }
             SP_LAP(ffn_residual);
             SP_TOKEN();
 
-            __atomic_store_n(&p->mt_phase, 0, __ATOMIC_RELEASE); /* reset for next token */
+            __atomic_store_n(&p->mt_phase, 0, __ATOMIC_RELEASE);
         } else {
-            while (__atomic_load_n(&p->mt_phase, __ATOMIC_ACQUIRE) != 0) { /* spin */ }
+            while (__atomic_load_n(&p->mt_phase, __ATOMIC_ACQUIRE) != 0) {}
         }
     }
 
@@ -370,6 +368,18 @@ void shirley_ffn_params_init(
         &p->ffn_sub_norm_gamma_mant, &p->ffn_sub_norm_gamma_exp,
         ffn_sub_norm ? (const float *)ffn_sub_norm->data : NULL, n_ff);
 
+    /* Q14 gamma for shirley_rmsnorm_ternary (sub_norm) */
+    if (ffn_sub_norm) {
+        const float * g = (const float *)ffn_sub_norm->data;
+        p->ffn_sub_norm_gamma_q14 = (int16_t *)malloc(n_ff * sizeof(int16_t));
+        for (int i = 0; i < n_ff; i++)
+            p->ffn_sub_norm_gamma_q14[i] = (int16_t)(g[i] * 16384.0f + 0.5f);
+    } else {
+        p->ffn_sub_norm_gamma_q14 = NULL;
+    }
+    /* Float gamma for shirley_rmsnorm_quantize (ffn_norm) */
+    p->ffn_norm_gamma_f32 = ffn_norm ? (const float *)ffn_norm->data : NULL;
+
     int max_dim = n_embd > n_ff ? n_embd : n_ff;
     p->w_act     = (int8_t  *)malloc(max_dim * sizeof(int8_t));
     p->w_gate    = (int8_t  *)malloc(n_ff * sizeof(int8_t));
@@ -387,8 +397,11 @@ void shirley_ffn_params_init(
     p->mt_gate    = malloc(n_ff * sizeof(mtfp21_t));
     p->mt_up      = malloc(n_ff * sizeof(mtfp21_t));
     p->mt_down    = malloc(n_embd * sizeof(mtfp21_t));
-    p->mt_gate_raw = (int32_t *)malloc(n_ff * sizeof(int32_t));
-    p->mt_up_raw   = (int32_t *)malloc(n_ff * sizeof(int32_t));
+    p->mt_gate_raw  = (int32_t *)malloc(n_ff * sizeof(int32_t));
+    p->mt_up_raw    = (int32_t *)malloc(n_ff * sizeof(int32_t));
+    p->mt_gate_i8   = (int8_t  *)malloc(n_ff * sizeof(int8_t));
+    p->mt_up_i8     = (int8_t  *)malloc(n_ff * sizeof(int8_t));
+    p->mt_trivials_i8 = (int8_t *)malloc(n_ff * sizeof(int8_t));
     p->mt_sub_act = (int16_t  *)malloc(n_ff * sizeof(int16_t));
 
     p->ready = 1;

@@ -32,11 +32,13 @@ struct shirley_ffn_params {
     float up_lscale;
     float down_lscale;
 
-    /* Gamma weights — precomputed as MTFP21 at model load */
-    int32_t * ffn_norm_gamma_mant;
+    /* Gamma weights — precomputed at model load */
+    int32_t * ffn_norm_gamma_mant;     /* MTFP21 for precision path */
     int8_t  * ffn_norm_gamma_exp;
     int32_t * ffn_sub_norm_gamma_mant;
     int8_t  * ffn_sub_norm_gamma_exp;
+    int16_t * ffn_sub_norm_gamma_q14;  /* Q14 for shirley_rmsnorm_ternary */
+    const float * ffn_norm_gamma_f32;  /* float for shirley_rmsnorm_quantize */
 
     int8_t  * w_act;
     int8_t  * w_gate;
@@ -55,8 +57,11 @@ struct shirley_ffn_params {
     void    * mt_gate;           /* mtfp21_t[n_ff] — for sub_norm path */
     void    * mt_up;             /* mtfp21_t[n_ff] */
     void    * mt_down;           /* mtfp21_t[n_embd] */
-    int32_t * mt_gate_raw;       /* raw int32 matmul output [n_ff] — for fused trivials */
+    int32_t * mt_gate_raw;       /* raw int32 matmul output [n_ff] */
     int32_t * mt_up_raw;         /* raw int32 matmul output [n_ff] */
+    int8_t  * mt_gate_i8;        /* int8 rescaled gate output [n_ff] */
+    int8_t  * mt_up_i8;          /* int8 rescaled up output [n_ff] */
+    int8_t  * mt_trivials_i8;    /* int8 output of trivials [n_ff] */
     int16_t * mt_sub_act;
     int8_t    mt_sub_bexp;
     volatile int mt_threads_done;
