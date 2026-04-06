@@ -233,20 +233,13 @@ void shirley_ffn_compute(
             __atomic_store_n(&p->mt_threads_done, 0, __ATOMIC_RELEASE);
             SP_LAP(ffn_gate_up);
 
-            /* ---- PHASE 2: Trivials (thread 0 only) ---- */
-            int16_t gate_mant16[n_ff], up_mant16[n_ff]; /* VLA */
-            int8_t gate_exp16[n_ff], up_exp16[n_ff]; /* VLA */
-            for (int i = 0; i < n_ff; i++) {
-                mtfp16_local_t g16 = to_mtfp16(((mtfp21_t*)p->mt_gate)[i]);
-                gate_mant16[i] = g16.mantissa; gate_exp16[i] = g16.exponent;
-                mtfp16_local_t u16 = to_mtfp16(((mtfp21_t*)p->mt_up)[i]);
-                up_mant16[i] = u16.mantissa; up_exp16[i] = u16.exponent;
-            }
-            mtfp16_relu_simd(gate_mant16, gate_exp16, gate_mant16, gate_exp16, n_ff);
-            int32_t sq_mant32[n_ff]; int8_t sq_exp8[n_ff]; /* VLA */
-            mtfp16_square_simd(sq_mant32, sq_exp8, gate_mant16, gate_exp16, n_ff);
+            /* ---- PHASE 2: Trivials — native MTFP21 operations ---- */
+            mtfp21_t * gate = (mtfp21_t *)p->mt_gate;
+            mtfp21_t * up   = (mtfp21_t *)p->mt_up;
+            mtfp21_relu(gate, gate, n_ff);
+            mtfp21_square(gate, gate, n_ff);
             mtfp21_t ffn_out[n_ff]; /* VLA */
-            mtfp_elem_mul_32x16(ffn_out, sq_mant32, sq_exp8, up_mant16, up_exp16, n_ff);
+            mtfp21_elem_mul(ffn_out, gate, up, n_ff);
             SP_LAP(ffn_trivials);
 
             /* ---- PHASE 3: Sub-norm (thread 0 only) ---- */

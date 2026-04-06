@@ -110,25 +110,34 @@ static void shirley_softmax_mtfp21(mtfp21_t * dst, const mtfp21_t * src, int n) 
  *  Attention compute — adaptive-width MTFP
  * ================================================================ */
 
-/* ================================================================
- *  Split-node attention: 5 callbacks, each a separate ggml graph node.
- *  ggml manages thread barriers. No spin-waits. Correct by construction.
- * ================================================================ */
-
 extern "C"
-void shirley_attn_prep(struct ggml_tensor * dst, const struct ggml_tensor * a, int ith, int nth, void * userdata) {
-    if (ith != 0) return;
+void shirley_attn_compute(
+    struct ggml_tensor * dst,
+    const struct ggml_tensor * a,
+    int ith, int nth,
+    void * userdata
+) {
+    if (ith != 0) return; /* single-threaded attention for now */
+
     struct shirley_attn_params * p = (struct shirley_attn_params *)userdata;
     const int n = p->n_embd;
+    const int n_head = p->n_head;
+    const int n_kv = p->n_kv_head;
+    const int hd = p->head_dim;
+    const int kv_dim = n_kv * hd;
     const int n_tokens = (int)a->ne[1];
+    float * output = (float *)dst->data;
 
     for (int tok = 0; tok < n_tokens; tok++) {
-        p->mt_input = (const float *)a->data + tok * n;
-        p->mt_output = (float *)dst->data + tok * n;
-        p->mt_pos = p->kv_pos + tok;
+        const float * input = (const float *)a->data + tok * n;
+        float * out_tok = output + tok * n;
+        int pos = p->kv_pos + tok;
+
+        SP_START;
 
         mtfp21_t inp_m[n]; /* VLA */
-        for (int i = 0; i < n; i++) inp_m[i] = mtfp21_from_float(p->mt_input[i]);
+        for (int i = 0; i < n; i++) inp_m[i] = mtfp21_from_float(input[i]);
+        SP_LAP(attn_input_conv);
 
         {
             int32_t m[n]; int8_t e[n]; /* VLA */
@@ -138,141 +147,107 @@ void shirley_attn_prep(struct ggml_tensor * dst, const struct ggml_tensor * a, i
                 n, p->eps_mant, p->eps_exp);
             for (int i = 0; i < n; i++) { inp_m[i].mantissa = m[i]; inp_m[i].exponent = e[i]; }
         }
+        SP_LAP(attn_norm);
 
-        p->mt_bexp = mtfp16_block_align_attn(p->mt_act, inp_m, n);
-    }
-    /* Note: for multi-token, only the LAST token's state is in mt_*.
-     * For single-token generation this is fine. Multi-token prompt eval
-     * needs to be handled with a token loop in each node. For now,
-     * this works correctly for n_tokens=1 (generation). */
-}
+        int16_t act_mant[n]; /* VLA */
+        int8_t block_exp = mtfp16_block_align_attn(act_mant, inp_m, n);
 
-extern "C"
-void shirley_attn_qkv(struct ggml_tensor * dst, const struct ggml_tensor * a, int ith, int nth, void * userdata) {
-    struct shirley_attn_params * p = (struct shirley_attn_params *)userdata;
-    const int n = p->n_embd;
-    const int kv_dim = p->n_kv_head * p->head_dim;
-    mtfp21_t * mt_q = (mtfp21_t *)p->mt_qkv;
-    mtfp21_t * mt_k = mt_q + n;
-    mtfp21_t * mt_v = mt_k + kv_dim;
+        mtfp21_t q_m[n]; /* VLA */
+        shirley_gemv_mtfp16(q_m, act_mant, block_exp, p->wq_data, n, n, p->wq_wscale);
+        mtfp21_t k_m[kv_dim]; /* VLA */
+        shirley_gemv_mtfp16(k_m, act_mant, block_exp, p->wk_data, n, kv_dim, p->wk_wscale);
+        mtfp21_t v_m[kv_dim]; /* VLA */
+        shirley_gemv_mtfp16(v_m, act_mant, block_exp, p->wv_data, n, kv_dim, p->wv_wscale);
+        SP_LAP(attn_qkv_matmul);
 
-    shirley_gemv_mtfp16_part(mt_q, p->mt_act, p->mt_bexp, p->wq_data, n, n, p->wq_wscale, ith, nth);
-    shirley_gemv_mtfp16_part(mt_k, p->mt_act, p->mt_bexp, p->wk_data, n, kv_dim, p->wk_wscale, ith, nth);
-    shirley_gemv_mtfp16_part(mt_v, p->mt_act, p->mt_bexp, p->wv_data, n, kv_dim, p->wv_wscale, ith, nth);
-}
+        int half_d = hd / 2;
+        const int32_t * cos_m = p->rope_cos_mant + pos * half_d;
+        const int8_t  * cos_e = p->rope_cos_exp  + pos * half_d;
+        const int32_t * sin_m = p->rope_sin_mant + pos * half_d;
+        const int8_t  * sin_e = p->rope_sin_exp  + pos * half_d;
 
-extern "C"
-void shirley_attn_body(struct ggml_tensor * dst, const struct ggml_tensor * a, int ith, int nth, void * userdata) {
-    if (ith != 0) return;
-    struct shirley_attn_params * p = (struct shirley_attn_params *)userdata;
-    const int n = p->n_embd;
-    const int n_head = p->n_head;
-    const int n_kv = p->n_kv_head;
-    const int hd = p->head_dim;
-    const int kv_dim = n_kv * hd;
-    int pos = p->mt_pos;
-    mtfp21_t * mt_q = (mtfp21_t *)p->mt_qkv;
-    mtfp21_t * mt_k = mt_q + n;
-    mtfp21_t * mt_v = mt_k + kv_dim;
+        mtfp21_t q_rot[n]; /* VLA */
+        for (int h = 0; h < n_head; h++)
+            shirley_rope_mtfp21(q_rot + h * hd, q_m + h * hd, cos_m, cos_e, sin_m, sin_e, hd);
+        mtfp21_t k_rot[kv_dim]; /* VLA */
+        for (int h = 0; h < n_kv; h++)
+            shirley_rope_mtfp21(k_rot + h * hd, k_m + h * hd, cos_m, cos_e, sin_m, sin_e, hd);
+        SP_LAP(attn_rope);
 
-    /* RoPE */
-    int half_d = hd / 2;
-    const int32_t * cos_m = p->rope_cos_mant + pos * half_d;
-    const int8_t  * cos_e = p->rope_cos_exp  + pos * half_d;
-    const int32_t * sin_m = p->rope_sin_mant + pos * half_d;
-    const int8_t  * sin_e = p->rope_sin_exp  + pos * half_d;
-
-    mtfp21_t q_rot[n]; /* VLA */
-    for (int h = 0; h < n_head; h++)
-        shirley_rope_mtfp21(q_rot + h * hd, mt_q + h * hd, cos_m, cos_e, sin_m, sin_e, hd);
-    mtfp21_t k_rot[kv_dim]; /* VLA */
-    for (int h = 0; h < n_kv; h++)
-        shirley_rope_mtfp21(k_rot + h * hd, mt_k + h * hd, cos_m, cos_e, sin_m, sin_e, hd);
-
-    /* Cache store */
-    for (int i = 0; i < kv_dim; i++) {
-        int idx = pos * kv_dim + i;
-        p->k_cache_mant[idx] = k_rot[i].mantissa;
-        p->k_cache_exp[idx]  = k_rot[i].exponent;
-        p->v_cache_mant[idx] = mt_v[i].mantissa;
-        p->v_cache_exp[idx]  = mt_v[i].exponent;
-    }
-
-    /* Q@K^T → softmax → attn@V */
-    int gqa_ratio = n_head / n_kv;
-    int kv_len = pos + 1;
-    mtfp21_t attn_out[n]; /* VLA */
-    int32_t q_mant_arr[n]; int8_t q_exp_arr[n]; /* VLA */
-    for (int i = 0; i < n; i++) { q_mant_arr[i] = q_rot[i].mantissa; q_exp_arr[i] = q_rot[i].exponent; }
-
-    for (int h = 0; h < n_head; h++) {
-        int kv_h = h / gqa_ratio;
-        mtfp21_t scores[kv_len]; /* VLA */
-        for (int t = 0; t < kv_len; t++) {
-            mtfp21_t dot = mtfp21_dot_chunked(
-                q_mant_arr + h * hd, q_exp_arr + h * hd,
-                p->k_cache_mant + t * kv_dim + kv_h * hd,
-                p->k_cache_exp  + t * kv_dim + kv_h * hd, hd);
-            scores[t] = mtfp21_mul(dot, (mtfp21_t){p->kq_scale_mant, p->kq_scale_exp});
+        for (int i = 0; i < kv_dim; i++) {
+            int idx = pos * kv_dim + i;
+            p->k_cache_mant[idx] = k_rot[i].mantissa;
+            p->k_cache_exp[idx]  = k_rot[i].exponent;
+            p->v_cache_mant[idx] = v_m[i].mantissa;
+            p->v_cache_exp[idx]  = v_m[i].exponent;
         }
-        shirley_softmax_mtfp21(scores, scores, kv_len);
+        SP_LAP(attn_kv_cache);
 
-        int32_t score_mant[kv_len]; int8_t score_exp[kv_len]; /* VLA */
-        for (int t = 0; t < kv_len; t++) { score_mant[t] = scores[t].mantissa; score_exp[t] = scores[t].exponent; }
-        mtfp21_t * out_h = attn_out + h * hd;
-        for (int d = 0; d < hd; d++) {
-            int32_t v_d_m[kv_len]; int8_t v_d_e[kv_len]; /* VLA */
+        int gqa_ratio = n_head / n_kv;
+        int kv_len = pos + 1;
+        mtfp21_t attn_out[n]; /* VLA */
+        int32_t q_mant_arr[n]; int8_t q_exp_arr[n]; /* VLA */
+        for (int i = 0; i < n; i++) { q_mant_arr[i] = q_rot[i].mantissa; q_exp_arr[i] = q_rot[i].exponent; }
+
+        for (int h = 0; h < n_head; h++) {
+            int kv_h = h / gqa_ratio;
+            mtfp21_t scores[kv_len]; /* VLA */
             for (int t = 0; t < kv_len; t++) {
-                int vidx = t * kv_dim + kv_h * hd + d;
-                v_d_m[t] = p->v_cache_mant[vidx]; v_d_e[t] = p->v_cache_exp[vidx];
+                mtfp21_t dot = mtfp21_dot_chunked(
+                    q_mant_arr + h * hd, q_exp_arr + h * hd,
+                    p->k_cache_mant + t * kv_dim + kv_h * hd,
+                    p->k_cache_exp  + t * kv_dim + kv_h * hd, hd);
+                scores[t] = mtfp21_mul(dot, (mtfp21_t){p->kq_scale_mant, p->kq_scale_exp});
             }
-            out_h[d] = mtfp21_dot_chunked(score_mant, score_exp, v_d_m, v_d_e, kv_len);
+            SP_LAP(attn_qk_dot);
+            shirley_softmax_mtfp21(scores, scores, kv_len);
+            SP_LAP(attn_softmax);
+
+            int32_t score_mant[kv_len]; int8_t score_exp[kv_len]; /* VLA */
+            for (int t = 0; t < kv_len; t++) { score_mant[t] = scores[t].mantissa; score_exp[t] = scores[t].exponent; }
+            mtfp21_t * out_h = attn_out + h * hd;
+            for (int d = 0; d < hd; d++) {
+                int32_t v_d_m[kv_len]; int8_t v_d_e[kv_len]; /* VLA */
+                for (int t = 0; t < kv_len; t++) {
+                    int vidx = t * kv_dim + kv_h * hd + d;
+                    v_d_m[t] = p->v_cache_mant[vidx]; v_d_e[t] = p->v_cache_exp[vidx];
+                }
+                out_h[d] = mtfp21_dot_chunked(score_mant, score_exp, v_d_m, v_d_e, kv_len);
+            }
         }
+        SP_LAP(attn_av);
+
+        {
+            int32_t ao_m[n]; int8_t ao_e[n]; /* VLA */
+            for (int i = 0; i < n; i++) { ao_m[i] = attn_out[i].mantissa; ao_e[i] = attn_out[i].exponent; }
+            int32_t nm[n]; int8_t ne_arr[n]; /* VLA */
+            mtfp21_rmsnorm_simd(nm, ne_arr, ao_m, ao_e,
+                p->sub_norm_gamma_mant, p->sub_norm_gamma_exp,
+                n, p->eps_mant, p->eps_exp);
+            mtfp21_t normed[n]; /* VLA */
+            for (int i = 0; i < n; i++) { normed[i].mantissa = nm[i]; normed[i].exponent = ne_arr[i]; }
+            int16_t wo_mant[n]; /* VLA */
+            int8_t wo_exp = mtfp16_block_align_attn(wo_mant, normed, n);
+            mtfp21_t wo_out[n]; /* VLA */
+            shirley_gemv_mtfp16(wo_out, wo_mant, wo_exp, p->wo_data, n, n,
+                p->wo_wscale * p->wo_lscale);
+            SP_LAP(attn_sub_norm_wo);
+            for (int i = 0; i < n; i++) {
+                mtfp21_t residual = mtfp21_from_float(input[i]);
+                out_tok[i] = mtfp21_to_float(mtfp21_add(wo_out[i], residual));
+            }
+            SP_LAP(attn_residual);
+        }
+        SP_TOKEN();
     }
 
-    /* sub_norm → block-align for wo */
-    {
-        int32_t ao_m[n]; int8_t ao_e[n]; /* VLA */
-        for (int i = 0; i < n; i++) { ao_m[i] = attn_out[i].mantissa; ao_e[i] = attn_out[i].exponent; }
-        int32_t nm[n]; int8_t ne_arr[n]; /* VLA */
-        mtfp21_rmsnorm_simd(nm, ne_arr, ao_m, ao_e,
-            p->sub_norm_gamma_mant, p->sub_norm_gamma_exp,
-            n, p->eps_mant, p->eps_exp);
-        mtfp21_t normed[n]; /* VLA */
-        for (int i = 0; i < n; i++) { normed[i].mantissa = nm[i]; normed[i].exponent = ne_arr[i]; }
-        p->mt_wo_bexp = mtfp16_block_align_attn(p->mt_wo_act, normed, n);
-    }
-}
-
-extern "C"
-void shirley_attn_wo(struct ggml_tensor * dst, const struct ggml_tensor * a, int ith, int nth, void * userdata) {
-    struct shirley_attn_params * p = (struct shirley_attn_params *)userdata;
-    const int n = p->n_embd;
-    mtfp21_t * mt_wo = (mtfp21_t *)p->mt_wo_out;
-    shirley_gemv_mtfp16_part(mt_wo, p->mt_wo_act, p->mt_wo_bexp,
-        p->wo_data, n, n, p->wo_wscale * p->wo_lscale, ith, nth);
-}
-
-extern "C"
-void shirley_attn_finish(struct ggml_tensor * dst, const struct ggml_tensor * a, int ith, int nth, void * userdata) {
-    if (ith != 0) return;
-    struct shirley_attn_params * p = (struct shirley_attn_params *)userdata;
-    const int n = p->n_embd;
-    mtfp21_t * mt_wo = (mtfp21_t *)p->mt_wo_out;
-
-    float * out = p->mt_output;
-    const float * inp = p->mt_input;
-    for (int i = 0; i < n; i++) {
-        mtfp21_t residual = mtfp21_from_float(inp[i]);
-        out[i] = mtfp21_to_float(mtfp21_add(mt_wo[i], residual));
-    }
-
-    p->kv_pos++;
+    p->kv_pos += n_tokens;
     if (p->kv_pos > p->kv_len) p->kv_len = p->kv_pos;
 
     static int logged = 0;
     if (!logged) {
-        fprintf(stderr, "shirley: MTFP16 attention active (split-node, threaded QKV+wo)\n");
+        fprintf(stderr, "shirley: MTFP16 attention active (layer %d, sign_epi16 QKV+wo, zero float matmul)\n",
+                p->layer_idx);
         logged = 1;
     }
 }
@@ -360,7 +335,9 @@ void shirley_attn_params_init(
     int max_dim = n_embd > (n_head * max_seq_len) ? n_embd : (n_head * max_seq_len);
     p->w_raw = (float *)malloc(max_dim * sizeof(float));
 
-    /* Split-node shared workspace */
+    /* Threading workspace */
+    p->mt_phase = 0;
+    p->mt_threads_done = 0;
     int kv_dim2 = n_kv_head * head_dim;
     p->mt_act    = (int16_t *)malloc(n_embd * sizeof(int16_t));
     p->mt_qkv    = malloc((n_embd + kv_dim2 + kv_dim2) * sizeof(mtfp21_t));
