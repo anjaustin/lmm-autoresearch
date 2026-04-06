@@ -70,6 +70,16 @@ struct shirley_attn_params {
     /* Pre-allocated workspace */
     float * w_raw;       /* [max(n_embd, n_head * max_seq_len)] */
 
+    /* Threading workspace */
+    volatile int mt_phase;
+    volatile int mt_threads_done;
+    int16_t * mt_act;         /* shared block-aligned activations */
+    int8_t    mt_bexp;
+    void    * mt_qkv;         /* mtfp21_t[n_embd + kv_dim + kv_dim] for Q,K,V */
+    int16_t * mt_wo_act;      /* block-aligned for wo matmul */
+    int8_t    mt_wo_bexp;
+    void    * mt_wo_out;      /* mtfp21_t[n_embd] */
+
     int ready;
 };
 

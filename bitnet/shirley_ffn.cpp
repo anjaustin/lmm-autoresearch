@@ -181,57 +181,7 @@ static void mtfp21_elem_mul(mtfp21_t * dst, const mtfp21_t * a, const mtfp21_t *
  *  FFN compute — adaptive-width MTFP, zero float in matmul path
  * ================================================================ */
 
-/* Threaded gemv: each thread computes its partition of output rows */
-static inline void shirley_gemv_mtfp16_part(
-    mtfp21_t * dst,
-    const int16_t * act_mant, int8_t block_exp,
-    const void * weight_data, int n_inner, int n_output,
-    float weight_scale, int ith, int nth
-) {
-    int rows_per = (n_output + nth - 1) / nth;
-    int r0 = ith * rows_per;
-    int r1 = r0 + rows_per;
-    if (r1 > n_output) r1 = n_output;
-    if (r0 >= r1) return;
-
-    const uint8_t * weights = (const uint8_t *)weight_data;
-    int row_bytes = n_inner / 4;
-    mtfp21_t ws = mtfp21_from_float(weight_scale);
-
-    /* Phase 1: dot products for our rows */
-    int32_t raw[r1 - r0]; /* VLA */
-    for (int i = 0; i < r1 - r0; i++) {
-        raw[i] = shirley_ternary_dot_mtfp16(
-            act_mant, weights + (r0 + i) * row_bytes, n_inner);
-    }
-
-    /* Phase 2: find local max */
-    int32_t max_abs = 0;
-    for (int i = 0; i < r1 - r0; i++) {
-        int32_t a = raw[i] > 0 ? raw[i] : -raw[i];
-        if (a > max_abs) max_abs = a;
-    }
-
-    /* Phase 3: normalize + weight scale */
-    int shift_down = 0;
-    { int64_t test = max_abs; while (test > MTFP21_MANT_MAX) { test /= 3; shift_down++; } }
-    int64_t divisor = (shift_down > 0 && shift_down < 32) ? POW3[shift_down] : 1;
-    int64_t half = divisor / 2;
-
-    for (int i = 0; i < r1 - r0; i++) {
-        if (raw[i] == 0) { dst[r0 + i] = (mtfp21_t){0, 0}; continue; }
-        int64_t m = (int64_t)raw[i];
-        int exp = (int)block_exp;
-        if (shift_down > 0) {
-            if (m >= 0) m = (m + half) / divisor;
-            else        m = -((-m + half) / divisor);
-            exp += shift_down;
-        }
-        while (m != 0 && llabs(m) * 3 <= MTFP21_MANT_MAX && exp > -MTFP21_EXP_MAX) { m *= 3; exp--; }
-        mtfp21_t r; r.mantissa = (int32_t)m; r.exponent = (int8_t)exp;
-        dst[r0 + i] = mtfp21_mul(r, ws);
-    }
-}
+/* shirley_gemv_mtfp16_part is now in shirley_mtfp16_matmul.h */
 
 extern "C"
 void shirley_ffn_compute(

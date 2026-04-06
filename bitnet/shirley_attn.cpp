@@ -117,13 +117,14 @@ void shirley_attn_compute(
     int ith, int nth,
     void * userdata
 ) {
-    if (ith != 0) return;
+    if (ith != 0) return; /* single-threaded attention for now */
 
     struct shirley_attn_params * p = (struct shirley_attn_params *)userdata;
     const int n = p->n_embd;
     const int n_head = p->n_head;
     const int n_kv = p->n_kv_head;
     const int hd = p->head_dim;
+    const int kv_dim = n_kv * hd;
     const int n_tokens = (int)a->ne[1];
     float * output = (float *)dst->data;
 
@@ -134,60 +135,45 @@ void shirley_attn_compute(
 
         SP_START;
 
-        /* Convert input to MTFP21 */
         mtfp21_t inp_m[n]; /* VLA */
         for (int i = 0; i < n; i++) inp_m[i] = mtfp21_from_float(input[i]);
         SP_LAP(attn_input_conv);
 
-        /* 0. attn_norm: SIMD RMSNorm */
         {
-            int32_t m[n]; int8_t e[n]; /* VLA — parallel arrays */
+            int32_t m[n]; int8_t e[n]; /* VLA */
             for (int i = 0; i < n; i++) { m[i] = inp_m[i].mantissa; e[i] = inp_m[i].exponent; }
             mtfp21_rmsnorm_simd(m, e, m, e,
                 p->attn_norm_gamma_mant, p->attn_norm_gamma_exp,
                 n, p->eps_mant, p->eps_exp);
             for (int i = 0; i < n; i++) { inp_m[i].mantissa = m[i]; inp_m[i].exponent = e[i]; }
         }
-
         SP_LAP(attn_norm);
 
-        /* 1. Block-align for QKV matmuls (MTFP21 → MTFP16) */
         int16_t act_mant[n]; /* VLA */
         int8_t block_exp = mtfp16_block_align_attn(act_mant, inp_m, n);
 
-        /* 2. Q matmul: MTFP16 × ternary → MTFP21 (sign_epi16, zero float) */
         mtfp21_t q_m[n]; /* VLA */
         shirley_gemv_mtfp16(q_m, act_mant, block_exp, p->wq_data, n, n, p->wq_wscale);
-
-        /* 3. K matmul */
-        int kv_dim = n_kv * hd;
         mtfp21_t k_m[kv_dim]; /* VLA */
         shirley_gemv_mtfp16(k_m, act_mant, block_exp, p->wk_data, n, kv_dim, p->wk_wscale);
-
-        /* 4. V matmul */
         mtfp21_t v_m[kv_dim]; /* VLA */
         shirley_gemv_mtfp16(v_m, act_mant, block_exp, p->wv_data, n, kv_dim, p->wv_wscale);
-
         SP_LAP(attn_qkv_matmul);
 
-        /* 5. RoPE on Q and K */
-        int half = hd / 2;
-        const int32_t * cos_m = p->rope_cos_mant + pos * half;
-        const int8_t  * cos_e = p->rope_cos_exp  + pos * half;
-        const int32_t * sin_m = p->rope_sin_mant + pos * half;
-        const int8_t  * sin_e = p->rope_sin_exp  + pos * half;
+        int half_d = hd / 2;
+        const int32_t * cos_m = p->rope_cos_mant + pos * half_d;
+        const int8_t  * cos_e = p->rope_cos_exp  + pos * half_d;
+        const int32_t * sin_m = p->rope_sin_mant + pos * half_d;
+        const int8_t  * sin_e = p->rope_sin_exp  + pos * half_d;
 
         mtfp21_t q_rot[n]; /* VLA */
         for (int h = 0; h < n_head; h++)
             shirley_rope_mtfp21(q_rot + h * hd, q_m + h * hd, cos_m, cos_e, sin_m, sin_e, hd);
-
         mtfp21_t k_rot[kv_dim]; /* VLA */
         for (int h = 0; h < n_kv; h++)
             shirley_rope_mtfp21(k_rot + h * hd, k_m + h * hd, cos_m, cos_e, sin_m, sin_e, hd);
-
         SP_LAP(attn_rope);
 
-        /* 6. Store K and V in cache — native MTFP21 per element */
         for (int i = 0; i < kv_dim; i++) {
             int idx = pos * kv_dim + i;
             p->k_cache_mant[idx] = k_rot[i].mantissa;
@@ -195,93 +181,57 @@ void shirley_attn_compute(
             p->v_cache_mant[idx] = v_m[i].mantissa;
             p->v_cache_exp[idx]  = v_m[i].exponent;
         }
-
         SP_LAP(attn_kv_cache);
 
-        /* 7. Attention: Q@K^T (chunked SIMD) → softmax → attn@V */
         int gqa_ratio = n_head / n_kv;
         int kv_len = pos + 1;
         mtfp21_t attn_out[n]; /* VLA */
-
-        /* Extract Q mantissa and exponent arrays per head for chunked dot */
-        int32_t q_mant_arr[n]; /* VLA */
-        int8_t  q_exp_arr[n]; /* VLA */
-        for (int i = 0; i < n; i++) {
-            q_mant_arr[i] = q_rot[i].mantissa;
-            q_exp_arr[i]  = q_rot[i].exponent;
-        }
+        int32_t q_mant_arr[n]; int8_t q_exp_arr[n]; /* VLA */
+        for (int i = 0; i < n; i++) { q_mant_arr[i] = q_rot[i].mantissa; q_exp_arr[i] = q_rot[i].exponent; }
 
         for (int h = 0; h < n_head; h++) {
             int kv_h = h / gqa_ratio;
-
             mtfp21_t scores[kv_len]; /* VLA */
             for (int t = 0; t < kv_len; t++) {
-                /* Chunked MTFP21 dot product: per-element exponents, 8-wide SIMD */
-                const int32_t * k_mant_ptr = p->k_cache_mant + t * kv_dim + kv_h * hd;
-                const int8_t  * k_exp_ptr  = p->k_cache_exp  + t * kv_dim + kv_h * hd;
-
                 mtfp21_t dot = mtfp21_dot_chunked(
                     q_mant_arr + h * hd, q_exp_arr + h * hd,
-                    k_mant_ptr, k_exp_ptr, hd);
-
-                mtfp21_t kqs = {p->kq_scale_mant, p->kq_scale_exp};
-                scores[t] = mtfp21_mul(dot, kqs);
+                    p->k_cache_mant + t * kv_dim + kv_h * hd,
+                    p->k_cache_exp  + t * kv_dim + kv_h * hd, hd);
+                scores[t] = mtfp21_mul(dot, (mtfp21_t){p->kq_scale_mant, p->kq_scale_exp});
             }
-
             SP_LAP(attn_qk_dot);
             shirley_softmax_mtfp21(scores, scores, kv_len);
             SP_LAP(attn_softmax);
 
-            /* attn@V: weighted sum of V vectors.
-             * For each head dim d: out[d] = Σ_t scores[t] × V[t][d]
-             * Extract scores into parallel arrays for chunked dot. */
-            int32_t score_mant[kv_len]; /* VLA */
-            int8_t  score_exp[kv_len]; /* VLA */
-            for (int t = 0; t < kv_len; t++) {
-                score_mant[t] = scores[t].mantissa;
-                score_exp[t]  = scores[t].exponent;
-            }
-
+            int32_t score_mant[kv_len]; int8_t score_exp[kv_len]; /* VLA */
+            for (int t = 0; t < kv_len; t++) { score_mant[t] = scores[t].mantissa; score_exp[t] = scores[t].exponent; }
             mtfp21_t * out_h = attn_out + h * hd;
             for (int d = 0; d < hd; d++) {
-                /* Gather V[t][d] across time positions */
-                int32_t v_d_mant[kv_len]; /* VLA */
-                int8_t  v_d_exp[kv_len]; /* VLA */
+                int32_t v_d_m[kv_len]; int8_t v_d_e[kv_len]; /* VLA */
                 for (int t = 0; t < kv_len; t++) {
                     int vidx = t * kv_dim + kv_h * hd + d;
-                    v_d_mant[t] = p->v_cache_mant[vidx];
-                    v_d_exp[t]  = p->v_cache_exp[vidx];
+                    v_d_m[t] = p->v_cache_mant[vidx]; v_d_e[t] = p->v_cache_exp[vidx];
                 }
-                out_h[d] = mtfp21_dot_chunked(score_mant, score_exp,
-                                               v_d_mant, v_d_exp, kv_len);
+                out_h[d] = mtfp21_dot_chunked(score_mant, score_exp, v_d_m, v_d_e, kv_len);
             }
         }
-
         SP_LAP(attn_av);
 
-        /* 8. attn_sub_norm (SIMD) + wo matmul (sign_epi16) */
         {
             int32_t ao_m[n]; int8_t ao_e[n]; /* VLA */
             for (int i = 0; i < n; i++) { ao_m[i] = attn_out[i].mantissa; ao_e[i] = attn_out[i].exponent; }
-
-            int32_t nm[n]; int8_t ne_arr[n]; /* VLA — normed output */
+            int32_t nm[n]; int8_t ne_arr[n]; /* VLA */
             mtfp21_rmsnorm_simd(nm, ne_arr, ao_m, ao_e,
                 p->sub_norm_gamma_mant, p->sub_norm_gamma_exp,
                 n, p->eps_mant, p->eps_exp);
-
             mtfp21_t normed[n]; /* VLA */
             for (int i = 0; i < n; i++) { normed[i].mantissa = nm[i]; normed[i].exponent = ne_arr[i]; }
-
-            /* wo matmul: MTFP16 × ternary → MTFP21 */
             int16_t wo_mant[n]; /* VLA */
             int8_t wo_exp = mtfp16_block_align_attn(wo_mant, normed, n);
-
             mtfp21_t wo_out[n]; /* VLA */
             shirley_gemv_mtfp16(wo_out, wo_mant, wo_exp, p->wo_data, n, n,
                 p->wo_wscale * p->wo_lscale);
-
             SP_LAP(attn_sub_norm_wo);
-            /* 9. Residual ADD + convert to float */
             for (int i = 0; i < n; i++) {
                 mtfp21_t residual = mtfp21_from_float(input[i]);
                 out_tok[i] = mtfp21_to_float(mtfp21_add(wo_out[i], residual));
@@ -385,7 +335,16 @@ void shirley_attn_params_init(
     int max_dim = n_embd > (n_head * max_seq_len) ? n_embd : (n_head * max_seq_len);
     p->w_raw = (float *)malloc(max_dim * sizeof(float));
 
+    /* Threading workspace */
+    p->mt_phase = 0;
+    p->mt_threads_done = 0;
+    int kv_dim2 = n_kv_head * head_dim;
+    p->mt_act    = (int16_t *)malloc(n_embd * sizeof(int16_t));
+    p->mt_qkv    = malloc((n_embd + kv_dim2 + kv_dim2) * sizeof(mtfp21_t));
+    p->mt_wo_act = (int16_t *)malloc(n_embd * sizeof(int16_t));
+    p->mt_wo_out = malloc(n_embd * sizeof(mtfp21_t));
+
     p->ready = 1;
 
-    fprintf(stderr, "shirley: MTFP16 attention init layer %d (sign_epi16 QKV+wo)\n", layer_idx);
+    fprintf(stderr, "shirley: MTFP16 attention init layer %d (sign_epi16 QKV+wo, threaded)\n", layer_idx);
 }
