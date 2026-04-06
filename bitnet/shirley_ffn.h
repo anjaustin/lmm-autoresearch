@@ -47,6 +47,18 @@ struct shirley_ffn_params {
     int16_t * w_sq;
     int32_t * w_prod;
 
+    /* Threading: shared workspace for multi-threaded matmul.
+     * Thread 0 prepares activations, all threads execute matmul rows. */
+    volatile int mt_phase;       /* atomic: 0=prep, 1=gate_up_ready, 2=gate_up_done, 3=down_ready, 4=down_done */
+    int16_t * mt_act;            /* shared block-aligned activations */
+    int8_t    mt_bexp;
+    void    * mt_gate;           /* mtfp21_t[n_ff] — opaque for header */
+    void    * mt_up;             /* mtfp21_t[n_ff] */
+    void    * mt_down;           /* mtfp21_t[n_embd] */
+    int16_t * mt_sub_act;
+    int8_t    mt_sub_bexp;
+    volatile int mt_threads_done;
+
     int ready;
 };
 

@@ -15479,7 +15479,7 @@ struct llm_build_context {
 
             /* Shirley FFN custom op — includes residual ADD */
             cur = ggml_map_custom1(ctx0, cur,
-                shirley_ffn_compute, 1,
+                shirley_ffn_compute, GGML_N_TASKS_MAX,
                 &shirley_ffn_layer_params[il]);
             cb(cur, "l_out", il);
 
