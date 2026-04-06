@@ -205,4 +205,27 @@ static inline void shirley_gemv_mtfp16_part(
     }
 }
 
+/* Raw output variant: int32 dot products, no normalization.
+ * For fused trivials where normalization is deferred. */
+static inline void shirley_gemv_mtfp16_part_raw(
+    int32_t * dst_raw,
+    const int16_t * act_mant,
+    const void * weight_data, int n_inner, int n_output,
+    int ith, int nth
+) {
+    int rows_per = (n_output + nth - 1) / nth;
+    int r0 = ith * rows_per;
+    int r1 = r0 + rows_per;
+    if (r1 > n_output) r1 = n_output;
+    if (r0 >= r1) return;
+
+    const uint8_t * weights = (const uint8_t *)weight_data;
+    int row_bytes = n_inner / 4;
+
+    for (int i = r0; i < r1; i++) {
+        dst_raw[i] = shirley_ternary_dot_mtfp16(
+            act_mant, weights + i * row_bytes, n_inner);
+    }
+}
+
 #endif /* SHIRLEY_MTFP16_MATMUL_H */

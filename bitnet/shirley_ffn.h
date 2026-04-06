@@ -52,9 +52,11 @@ struct shirley_ffn_params {
     volatile int mt_phase;       /* atomic: 0=prep, 1=gate_up_ready, 2=gate_up_done, 3=down_ready, 4=down_done */
     int16_t * mt_act;            /* shared block-aligned activations */
     int8_t    mt_bexp;
-    void    * mt_gate;           /* mtfp21_t[n_ff] — opaque for header */
+    void    * mt_gate;           /* mtfp21_t[n_ff] — for sub_norm path */
     void    * mt_up;             /* mtfp21_t[n_ff] */
     void    * mt_down;           /* mtfp21_t[n_embd] */
+    int32_t * mt_gate_raw;       /* raw int32 matmul output [n_ff] — for fused trivials */
+    int32_t * mt_up_raw;         /* raw int32 matmul output [n_ff] */
     int16_t * mt_sub_act;
     int8_t    mt_sub_bexp;
     volatile int mt_threads_done;

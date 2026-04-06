@@ -221,11 +221,11 @@ void shirley_ffn_compute(
             while (__atomic_load_n(&p->mt_phase, __ATOMIC_ACQUIRE) < 1) { /* spin */ }
         }
 
-        /* ---- PHASE 1: Gate + Up matmul (ALL threads) ---- */
-        shirley_gemv_mtfp16_part(((mtfp21_t*)p->mt_gate), p->mt_act, p->mt_bexp,
-            p->gate_data, n, n_ff, p->gate_wscale * p->gate_lscale, ith, nth);
-        shirley_gemv_mtfp16_part(((mtfp21_t*)p->mt_up), p->mt_act, p->mt_bexp,
-            p->up_data, n, n_ff, p->up_wscale * p->up_lscale, ith, nth);
+        /* ---- PHASE 1: Gate + Up matmul — raw int32 output (ALL threads) ---- */
+        shirley_gemv_mtfp16_part_raw(p->mt_gate_raw, p->mt_act,
+            p->gate_data, n, n_ff, ith, nth);
+        shirley_gemv_mtfp16_part_raw(p->mt_up_raw, p->mt_act,
+            p->up_data, n, n_ff, ith, nth);
 
         __atomic_fetch_add(&p->mt_threads_done, 1, __ATOMIC_ACQ_REL);
         if (ith == 0) {
@@ -233,13 +233,60 @@ void shirley_ffn_compute(
             __atomic_store_n(&p->mt_threads_done, 0, __ATOMIC_RELEASE);
             SP_LAP(ffn_gate_up);
 
-            /* ---- PHASE 2: Trivials — native MTFP21 operations ---- */
-            mtfp21_t * gate = (mtfp21_t *)p->mt_gate;
-            mtfp21_t * up   = (mtfp21_t *)p->mt_up;
-            mtfp21_relu(gate, gate, n_ff);
-            mtfp21_square(gate, gate, n_ff);
+            /* ---- PHASE 2: Fused trivials — deferred normalization ----
+             * raw int32 gate/up → relu(sign check) → square(int64) → multiply(int64)
+             * → ONE normalization to MTFP21. No intermediate trit-shift loops.
+             *
+             * Weight scales applied as MTFP21 multiply after normalization. */
+            float gate_ws = p->gate_wscale * p->gate_lscale;
+            float up_ws   = p->up_wscale * p->up_lscale;
+            /* Combined scale for the fused result:
+             * real = gate_raw × gate_ws × gate_ws × up_raw × up_ws / act_scale³
+             * (gate_ws appears twice because of square)
+             * But we track exponents: block_exp contributes to both gate and up.
+             * gate_real = gate_raw × 3^block_exp × gate_ws
+             * gate²_real = gate_raw² × 3^(2×block_exp) × gate_ws²
+             * result_real = gate²_real × up_real = gate_raw² × up_raw × 3^(3×block_exp) × gate_ws² × up_ws */
+            mtfp21_t combined_ws = mtfp21_mul(
+                mtfp21_mul(mtfp21_from_float(gate_ws), mtfp21_from_float(gate_ws)),
+                mtfp21_from_float(up_ws));
+            int combined_exp = (int)p->mt_bexp * 3; /* 3× because gate² × up uses block_exp three times */
+
             mtfp21_t ffn_out[n_ff]; /* VLA */
-            mtfp21_elem_mul(ffn_out, gate, up, n_ff);
+            for (int i = 0; i < n_ff; i++) {
+                int32_t g = p->mt_gate_raw[i];
+                int32_t u = p->mt_up_raw[i];
+
+                /* ReLU: check sign. No normalization. */
+                if (g <= 0) { ffn_out[i] = (mtfp21_t){0, 0}; continue; }
+
+                /* Square × Up: int32 × int32 → int64, then × int32 → int64
+                 * g² × u. Max: 75M² × 75M = 4.2e23. Fits int64 (max 9.2e18)...
+                 * NO — 75M² = 5.6e15, × 75M = 4.2e23. Does NOT fit int64 (max 9.2e18).
+                 * Need to scale down before multiplying. */
+                int64_t g_sq = (int64_t)g * (int64_t)g;
+                /* Normalize g_sq to fit before multiplying by u */
+                int extra_exp = 0;
+                while (llabs(g_sq) > 2000000000LL) { /* keep within safe int64 range for × u */
+                    g_sq /= 3;
+                    extra_exp++;
+                }
+                int64_t result = g_sq * (int64_t)u;
+
+                /* Normalize to MTFP21 — ONE normalization for the entire trivials */
+                int exp = combined_exp + extra_exp;
+                while (llabs(result) > MTFP21_MANT_MAX) {
+                    int64_t rem = result % 3; result /= 3;
+                    if (rem == 2) result++; else if (rem == -2) result--;
+                    exp++;
+                }
+                while (result != 0 && llabs(result) * 3 <= MTFP21_MANT_MAX && exp > -MTFP21_EXP_MAX) {
+                    result *= 3; exp--;
+                }
+
+                mtfp21_t r; r.mantissa = (int32_t)result; r.exponent = (int8_t)exp;
+                ffn_out[i] = mtfp21_mul(r, combined_ws);
+            }
             SP_LAP(ffn_trivials);
 
             /* ---- PHASE 3: Sub-norm (thread 0 only) ---- */
@@ -340,6 +387,8 @@ void shirley_ffn_params_init(
     p->mt_gate    = malloc(n_ff * sizeof(mtfp21_t));
     p->mt_up      = malloc(n_ff * sizeof(mtfp21_t));
     p->mt_down    = malloc(n_embd * sizeof(mtfp21_t));
+    p->mt_gate_raw = (int32_t *)malloc(n_ff * sizeof(int32_t));
+    p->mt_up_raw   = (int32_t *)malloc(n_ff * sizeof(int32_t));
     p->mt_sub_act = (int16_t  *)malloc(n_ff * sizeof(int16_t));
 
     p->ready = 1;
