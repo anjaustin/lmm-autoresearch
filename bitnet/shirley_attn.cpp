@@ -28,6 +28,7 @@ void ggml_gemv_i2_i8_s(int n, float * s, size_t bs,
     const void * vx, const void * vy, int nr, int nc);
 }
 #include "shirley_profile.h"
+#include "shirley_barrier.h"
 
 /* ================================================================
  *  MTFP16 conversions (same as in shirley_ffn.cpp — should factor out)
@@ -122,8 +123,6 @@ void shirley_attn_compute(
     int ith, int nth,
     void * userdata
 ) {
-    if (ith != 0) return; /* single-threaded — threading via split-node is future work */
-
     struct shirley_attn_params * p = (struct shirley_attn_params *)userdata;
     const int n = p->n_embd;
     const int n_head = p->n_head;
@@ -133,6 +132,8 @@ void shirley_attn_compute(
     const int n_tokens = (int)a->ne[1];
     float * output = (float *)dst->data;
 
+    /* Phase managed per-token: 0 → 1 (norm) → 3 (body) → 0 (done) */
+
     for (int tok = 0; tok < n_tokens; tok++) {
         const float * input = (const float *)a->data + tok * n;
         float * out_tok = output + tok * n;
@@ -140,132 +141,187 @@ void shirley_attn_compute(
 
         SP_START;
 
-        /* ---- attn_norm: shirley_rmsnorm_quantize (float→int8) ---- */
-        int8_t act_i8[n]; /* VLA */
-        shirley_rmsnorm_quantize(act_i8, input, p->attn_norm_gamma_f32, n, p->eps, 80);
-        SP_LAP(attn_norm);
-
-        /* ---- QKV matmul: sign_epi8, 32 lanes ---- */
-        float q_f[n]; /* VLA */
-        ggml_gemv_i2_i8_s(n, q_f, n, p->wq_data, act_i8, 1, n);
-        float k_f[kv_dim]; /* VLA */
-        ggml_gemv_i2_i8_s(n, k_f, kv_dim, p->wk_data, act_i8, 1, kv_dim);
-        float v_f[kv_dim]; /* VLA */
-        ggml_gemv_i2_i8_s(n, v_f, kv_dim, p->wv_data, act_i8, 1, kv_dim);
-
-        /* Apply weight scales */
-        for (int i = 0; i < n; i++) q_f[i] *= p->wq_wscale;
-        for (int i = 0; i < kv_dim; i++) k_f[i] *= p->wk_wscale;
-        for (int i = 0; i < kv_dim; i++) v_f[i] *= p->wv_wscale;
-        SP_LAP(attn_qkv_matmul);
-
-        /* ---- RoPE: float multiply + add using precomputed tables ---- */
-        int half_d = hd / 2;
-        float * rope_cos_f = (float *)__builtin_alloca(half_d * sizeof(float));
-        float * rope_sin_f = (float *)__builtin_alloca(half_d * sizeof(float));
-        for (int i = 0; i < half_d; i++) {
-            rope_cos_f[i] = mtfp21_to_float((mtfp21_t){p->rope_cos_mant[pos * half_d + i], p->rope_cos_exp[pos * half_d + i]});
-            rope_sin_f[i] = mtfp21_to_float((mtfp21_t){p->rope_sin_mant[pos * half_d + i], p->rope_sin_exp[pos * half_d + i]});
+        /* ---- attn_norm (thread 0) ---- */
+        if (ith == 0) {
+            shirley_rmsnorm_quantize(p->mt_act_i8, input, p->attn_norm_gamma_f32, n, p->eps, 80);
+            SP_LAP(attn_norm);
+            __atomic_store_n(&p->mt_phase, 1, __ATOMIC_RELEASE);
+        } else {
+            while (__atomic_load_n(&p->mt_phase, __ATOMIC_ACQUIRE) < 1) { _mm_pause(); }
         }
-        /* Apply RoPE to Q and K in float */
-        for (int h = 0; h < n_head; h++) {
-            float * qh = q_f + h * hd;
-            for (int i = 0; i < half_d; i++) {
-                float x0 = qh[i], x1 = qh[i + half_d];
-                qh[i]          = x0 * rope_cos_f[i] - x1 * rope_sin_f[i];
-                qh[i + half_d] = x0 * rope_sin_f[i] + x1 * rope_cos_f[i];
-            }
-        }
-        for (int h = 0; h < n_kv; h++) {
-            float * kh = k_f + h * hd;
-            for (int i = 0; i < half_d; i++) {
-                float x0 = kh[i], x1 = kh[i + half_d];
-                kh[i]          = x0 * rope_cos_f[i] - x1 * rope_sin_f[i];
-                kh[i + half_d] = x0 * rope_sin_f[i] + x1 * rope_cos_f[i];
-            }
-        }
-        SP_LAP(attn_rope);
 
-        /* ---- KV cache: store float ---- */
-        float * k_cache_pos = p->w_raw; /* reuse workspace */
-        memcpy(p->w_raw + 0, k_f, kv_dim * sizeof(float)); /* temp — we need float cache */
-        /* Store K and V in float cache arrays.
-         * Reuse the MTFP21 cache arrays as float (same size: int32 ≈ float) */
-        float * k_cache_f = (float *)p->k_cache_mant; /* reinterpret */
-        float * v_cache_f = (float *)p->v_cache_mant;
-        memcpy(k_cache_f + pos * kv_dim, k_f, kv_dim * sizeof(float));
-        memcpy(v_cache_f + pos * kv_dim, v_f, kv_dim * sizeof(float));
-        SP_LAP(attn_kv_cache);
-
-        /* ---- Q@K^T: float dot product ---- */
-        int gqa_ratio = n_head / n_kv;
-        int kv_len = pos + 1;
-        float attn_out_f[n]; /* VLA */
-
-        for (int h = 0; h < n_head; h++) {
-            int kv_h = h / gqa_ratio;
-            float * qh = q_f + h * hd;
-
-            float scores[kv_len]; /* VLA */
-            for (int t = 0; t < kv_len; t++) {
-                float dot = 0.0f;
-                float * kt = k_cache_f + t * kv_dim + kv_h * hd;
-                for (int d = 0; d < hd; d++) dot += qh[d] * kt[d];
-                scores[t] = dot * p->kq_scale;
-            }
-            SP_LAP(attn_qk_dot);
-
-            /* Softmax in float */
-            {
-                float max_s = scores[0];
-                for (int t = 1; t < kv_len; t++) if (scores[t] > max_s) max_s = scores[t];
-                float sum = 0.0f;
-                for (int t = 0; t < kv_len; t++) { scores[t] = expf(scores[t] - max_s); sum += scores[t]; }
-                float inv_sum = 1.0f / sum;
-                for (int t = 0; t < kv_len; t++) scores[t] *= inv_sum;
-            }
-            SP_LAP(attn_softmax);
-
-            /* attn@V: weighted sum */
-            float * out_h = attn_out_f + h * hd;
-            for (int d = 0; d < hd; d++) {
-                float sum = 0.0f;
-                for (int t = 0; t < kv_len; t++) {
-                    sum += scores[t] * v_cache_f[t * kv_dim + kv_h * hd + d];
-                }
-                out_h[d] = sum;
-            }
-        }
-        SP_LAP(attn_av);
-
-        /* ---- sub_norm + wo matmul ---- */
+        /* ---- PHASE 1: QKV matmul — ALL threads, partitioned by rows ---- */
         {
-            /* sub_norm: shirley_rmsnorm_quantize (float→int8) */
-            int8_t sub_i8[n]; /* VLA */
-            shirley_rmsnorm_quantize(sub_i8, attn_out_f, p->sub_norm_gamma_f32, n, p->eps, 80);
+            /* Q matmul: n_embd output rows */
+            int rows_per = (n + nth - 1) / nth;
+            int r0 = ith * rows_per;
+            int r1 = r0 + rows_per; if (r1 > n) r1 = n;
+            if (r0 < r1) {
+                float q_tmp[r1 - r0]; /* VLA */
+                ggml_gemv_i2_i8_s(n, q_tmp, r1 - r0,
+                    (const char *)p->wq_data + (int64_t)r0 * (n / 4),
+                    p->mt_act_i8, 1, r1 - r0);
+                for (int i = 0; i < r1 - r0; i++)
+                    p->mt_q_f[r0 + i] = q_tmp[i] * p->wq_wscale;
+            }
 
-            /* wo matmul: sign_epi8, 32 lanes */
-            float wo_f[n]; /* VLA */
-            ggml_gemv_i2_i8_s(n, wo_f, n, p->wo_data, sub_i8, 1, n);
-            float wo_cs = p->wo_wscale * p->wo_lscale;
-            SP_LAP(attn_sub_norm_wo);
+            /* K matmul: kv_dim output rows */
+            rows_per = (kv_dim + nth - 1) / nth;
+            r0 = ith * rows_per;
+            r1 = r0 + rows_per; if (r1 > kv_dim) r1 = kv_dim;
+            if (r0 < r1) {
+                float k_tmp[r1 - r0]; /* VLA */
+                ggml_gemv_i2_i8_s(n, k_tmp, r1 - r0,
+                    (const char *)p->wk_data + (int64_t)r0 * (n / 4),
+                    p->mt_act_i8, 1, r1 - r0);
+                for (int i = 0; i < r1 - r0; i++)
+                    p->mt_k_f[r0 + i] = k_tmp[i] * p->wk_wscale;
+            }
 
-            /* Residual + output */
+            /* V matmul: kv_dim output rows */
+            r0 = ith * ((kv_dim + nth - 1) / nth);
+            r1 = r0 + ((kv_dim + nth - 1) / nth); if (r1 > kv_dim) r1 = kv_dim;
+            if (r0 < r1) {
+                float v_tmp[r1 - r0]; /* VLA */
+                ggml_gemv_i2_i8_s(n, v_tmp, r1 - r0,
+                    (const char *)p->wv_data + (int64_t)r0 * (n / 4),
+                    p->mt_act_i8, 1, r1 - r0);
+                for (int i = 0; i < r1 - r0; i++)
+                    p->mt_v_f[r0 + i] = v_tmp[i] * p->wv_wscale;
+            }
+        }
+
+        /* Barrier: wait for all threads to finish QKV */
+        __atomic_fetch_add(&p->mt_threads_done, 1, __ATOMIC_ACQ_REL);
+        if (ith == 0) {
+            while (__atomic_load_n(&p->mt_threads_done, __ATOMIC_ACQUIRE) < nth) { _mm_pause(); }
+            __atomic_store_n(&p->mt_threads_done, 0, __ATOMIC_RELEASE);
+            SP_LAP(attn_qkv_matmul);
+
+            /* ---- PHASE 2: RoPE + KV cache (thread 0) ---- */
+            float * q_f = p->mt_q_f;
+            float * k_f = p->mt_k_f;
+            float * v_f = p->mt_v_f;
+
+            int half_d = hd / 2;
+            float * rope_cos_f = (float *)__builtin_alloca(half_d * sizeof(float));
+            float * rope_sin_f = (float *)__builtin_alloca(half_d * sizeof(float));
+            for (int i = 0; i < half_d; i++) {
+                rope_cos_f[i] = mtfp21_to_float((mtfp21_t){p->rope_cos_mant[pos * half_d + i], p->rope_cos_exp[pos * half_d + i]});
+                rope_sin_f[i] = mtfp21_to_float((mtfp21_t){p->rope_sin_mant[pos * half_d + i], p->rope_sin_exp[pos * half_d + i]});
+            }
+            for (int h = 0; h < n_head; h++) {
+                float * qh = q_f + h * hd;
+                for (int i = 0; i < half_d; i++) {
+                    float x0 = qh[i], x1 = qh[i + half_d];
+                    qh[i]          = x0 * rope_cos_f[i] - x1 * rope_sin_f[i];
+                    qh[i + half_d] = x0 * rope_sin_f[i] + x1 * rope_cos_f[i];
+                }
+            }
+            for (int h = 0; h < n_kv; h++) {
+                float * kh = k_f + h * hd;
+                for (int i = 0; i < half_d; i++) {
+                    float x0 = kh[i], x1 = kh[i + half_d];
+                    kh[i]          = x0 * rope_cos_f[i] - x1 * rope_sin_f[i];
+                    kh[i + half_d] = x0 * rope_sin_f[i] + x1 * rope_cos_f[i];
+                }
+            }
+            SP_LAP(attn_rope);
+
+            float * k_cache_f = (float *)p->k_cache_mant;
+            float * v_cache_f = (float *)p->v_cache_mant;
+            memcpy(k_cache_f + pos * kv_dim, k_f, kv_dim * sizeof(float));
+            memcpy(v_cache_f + pos * kv_dim, v_f, kv_dim * sizeof(float));
+            SP_LAP(attn_kv_cache);
+
+            /* Q@K^T + softmax + attn@V — thread 0 only */
+            int gqa_ratio = n_head / n_kv;
+            int kv_len = pos + 1;
+
+            for (int h = 0; h < n_head; h++) {
+                int kv_h = h / gqa_ratio;
+                float * qh = q_f + h * hd;
+
+                float scores[kv_len]; /* VLA */
+                for (int t = 0; t < kv_len; t++) {
+                    float dot = 0.0f;
+                    float * kt = k_cache_f + t * kv_dim + kv_h * hd;
+                    for (int d = 0; d < hd; d++) dot += qh[d] * kt[d];
+                    scores[t] = dot * p->kq_scale;
+                }
+
+                {
+                    float max_s = scores[0];
+                    for (int t = 1; t < kv_len; t++) if (scores[t] > max_s) max_s = scores[t];
+                    float sum = 0.0f;
+                    for (int t = 0; t < kv_len; t++) { scores[t] = expf(scores[t] - max_s); sum += scores[t]; }
+                    float inv_sum = 1.0f / sum;
+                    for (int t = 0; t < kv_len; t++) scores[t] *= inv_sum;
+                }
+
+                float * out_h = p->mt_attn_out + h * hd;
+                for (int d = 0; d < hd; d++) {
+                    float sum = 0.0f;
+                    for (int t = 0; t < kv_len; t++) {
+                        sum += scores[t] * v_cache_f[t * kv_dim + kv_h * hd + d];
+                    }
+                    out_h[d] = sum;
+                }
+            }
+            SP_LAP(attn_av);
+
+            shirley_rmsnorm_quantize(p->mt_sub_i8, p->mt_attn_out, p->sub_norm_gamma_f32, n, p->eps, 80);
+            SP_LAP(attn_sub_norm);
+
+            __atomic_store_n(&p->mt_phase, 3, __ATOMIC_RELEASE);
+        } else {
+            while (__atomic_load_n(&p->mt_phase, __ATOMIC_ACQUIRE) < 3) { _mm_pause(); }
+        }
+
+        /* ---- wo matmul — ALL threads, partitioned by rows ---- */
+        {
+            int rows_per = (n + nth - 1) / nth;
+            int r0 = ith * rows_per;
+            int r1 = r0 + rows_per; if (r1 > n) r1 = n;
+            if (r0 < r1) {
+                float wo_tmp[r1 - r0]; /* VLA */
+                ggml_gemv_i2_i8_s(n, wo_tmp, r1 - r0,
+                    (const char *)p->wo_data + (int64_t)r0 * (n / 4),
+                    p->mt_sub_i8, 1, r1 - r0);
+                float wo_cs = p->wo_wscale * p->wo_lscale;
+                for (int i = 0; i < r1 - r0; i++) {
+                    p->mt_wo_f[r0 + i] = wo_tmp[i] * wo_cs;
+                }
+            }
+        }
+
+        /* Barrier: all threads finish wo */
+        __atomic_fetch_add(&p->mt_threads_done, 1, __ATOMIC_ACQ_REL);
+        if (ith == 0) {
+            while (__atomic_load_n(&p->mt_threads_done, __ATOMIC_ACQUIRE) < nth) { _mm_pause(); }
+            __atomic_store_n(&p->mt_threads_done, 0, __ATOMIC_RELEASE);
+            SP_LAP(attn_wo);
+
             for (int i = 0; i < n; i++) {
-                out_tok[i] = wo_f[i] * wo_cs + input[i];
+                out_tok[i] = p->mt_wo_f[i] + input[i];
             }
             SP_LAP(attn_residual);
+            SP_TOKEN();
+
+            __atomic_store_n(&p->mt_phase, 0, __ATOMIC_RELEASE);
+        } else {
+            while (__atomic_load_n(&p->mt_phase, __ATOMIC_ACQUIRE) != 0) { _mm_pause(); }
         }
-        SP_TOKEN();
     }
 
-    p->kv_pos += n_tokens;
-    if (p->kv_pos > p->kv_len) p->kv_len = p->kv_pos;
-
-    static int logged = 0;
-    if (!logged) {
-        fprintf(stderr, "shirley: kernel attention active (sign_epi8 QKV+wo, float attention body)\n");
-        logged = 1;
+    if (ith == 0) {
+        p->kv_pos += n_tokens;
+        if (p->kv_pos > p->kv_len) p->kv_len = p->kv_pos;
+        static int logged = 0;
+        if (!logged) {
+            fprintf(stderr, "shirley: multi-threaded attention active (sign_epi8 QKV+wo, float body)\n");
+            logged = 1;
+        }
     }
 }
 
@@ -371,10 +427,13 @@ void shirley_attn_params_init(
     p->mt_phase = 0;
     p->mt_threads_done = 0;
     int kv_dim2 = n_kv_head * head_dim;
-    p->mt_act    = (int16_t *)malloc(n_embd * sizeof(int16_t));
-    p->mt_qkv    = malloc((n_embd + kv_dim2 + kv_dim2) * sizeof(mtfp21_t));
-    p->mt_wo_act = (int16_t *)malloc(n_embd * sizeof(int16_t));
-    p->mt_wo_out = malloc(n_embd * sizeof(mtfp21_t));
+    p->mt_act_i8   = (int8_t *)malloc(n_embd * sizeof(int8_t));
+    p->mt_q_f      = (float *)malloc(n_embd * sizeof(float));
+    p->mt_k_f      = (float *)malloc(kv_dim2 * sizeof(float));
+    p->mt_v_f      = (float *)malloc(kv_dim2 * sizeof(float));
+    p->mt_attn_out = (float *)malloc(n_embd * sizeof(float));
+    p->mt_sub_i8   = (int8_t *)malloc(n_embd * sizeof(int8_t));
+    p->mt_wo_f     = (float *)malloc(n_embd * sizeof(float));
 
     p->ready = 1;
 

@@ -23,7 +23,8 @@ static struct {
     double attn_qk_dot;
     double attn_softmax;
     double attn_av;
-    double attn_sub_norm_wo;
+    double attn_sub_norm;
+    double attn_wo;
     double attn_residual;
     double ffn_input_conv;
     double ffn_norm;
@@ -39,7 +40,7 @@ static inline void _shirley_profile_print(void) {
     if (_sp.tokens == 0) return;
     double total = _sp.attn_input_conv + _sp.attn_norm + _sp.attn_qkv_matmul +
         _sp.attn_rope + _sp.attn_kv_cache + _sp.attn_qk_dot + _sp.attn_softmax +
-        _sp.attn_av + _sp.attn_sub_norm_wo + _sp.attn_residual +
+        _sp.attn_av + _sp.attn_sub_norm + _sp.attn_wo + _sp.attn_residual +
         _sp.ffn_input_conv + _sp.ffn_norm + _sp.ffn_gate_up +
         _sp.ffn_trivials + _sp.ffn_sub_norm + _sp.ffn_down + _sp.ffn_residual;
 
@@ -53,7 +54,8 @@ static inline void _shirley_profile_print(void) {
     fprintf(stderr, "  Q@K^T:        %6.1f ms (%4.1f%%)\n", _sp.attn_qk_dot*1000, _sp.attn_qk_dot/total*100);
     fprintf(stderr, "  softmax:      %6.1f ms (%4.1f%%)\n", _sp.attn_softmax*1000, _sp.attn_softmax/total*100);
     fprintf(stderr, "  attn@V:       %6.1f ms (%4.1f%%)\n", _sp.attn_av*1000, _sp.attn_av/total*100);
-    fprintf(stderr, "  sub_norm+wo:  %6.1f ms (%4.1f%%)\n", _sp.attn_sub_norm_wo*1000, _sp.attn_sub_norm_wo/total*100);
+    fprintf(stderr, "  sub_norm:     %6.1f ms (%4.1f%%)\n", _sp.attn_sub_norm*1000, _sp.attn_sub_norm/total*100);
+    fprintf(stderr, "  wo matmul:    %6.1f ms (%4.1f%%)\n", _sp.attn_wo*1000, _sp.attn_wo/total*100);
     fprintf(stderr, "  residual:     %6.1f ms (%4.1f%%)\n", _sp.attn_residual*1000, _sp.attn_residual/total*100);
     fprintf(stderr, "FFN:\n");
     fprintf(stderr, "  input_conv:   %6.1f ms (%4.1f%%)\n", _sp.ffn_input_conv*1000, _sp.ffn_input_conv/total*100);

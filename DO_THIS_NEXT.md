@@ -2,78 +2,115 @@
 
 ## Current Status (2026-04-06)
 
-Native MTFP21 throughout the between-matmul path. No format conversions between operations.
+Kernel-based pipeline: sign_epi8 matmuls (32 lanes), AVX2 integer trivials, float attention body. Multi-threaded QKV+wo matmuls (all threads), attention body + FFN trivials on thread 0.
 
 ```
-Embedding (float32)
-→ mtfp21_from_float (model boundary)
+Embedding (float32, ggml)
 
 Per layer:
-  ATTENTION (single-threaded):
-    MTFP21 → rmsnorm → block-align → [int16 matmul wire] → MTFP21 (QKV)
-    MTFP21: RoPE, cache, Q@K^T, softmax, attn@V (native MTFP21 ops)
-    MTFP21 → rmsnorm → block-align → [int16 matmul wire] → MTFP21 (wo)
-    MTFP21: residual ADD
-    → mtfp21_to_float (ggml boundary)
+  ATTENTION (multi-threaded QKV+wo):
+    float → shirley_rmsnorm_quantize → int8                [thread 0]
+    int8 × 2bit → sign_epi8 QKV matmuls → float           [ALL threads]
+    float: RoPE (precomputed MTFP21→float tables)          [thread 0]
+    float: KV cache store                                   [thread 0]
+    float: Q@K^T dot product                                [thread 0]
+    float: softmax (expf)                                   [thread 0]
+    float: attn@V weighted sum                              [thread 0]
+    float → shirley_rmsnorm_quantize → int8                [thread 0]
+    int8 × 2bit → sign_epi8 wo matmul → float             [ALL threads]
+    float: residual ADD                                     [thread 0]
 
-  FFN (multi-threaded matmuls):
-    mtfp21_from_float (ggml boundary)
-    MTFP21 → rmsnorm → block-align → [int16 matmul wire] → MTFP21 (gate, up)
-    MTFP21: mtfp21_relu → mtfp21_square → mtfp21_elem_mul (NATIVE — 3 calls)
-    MTFP21 → rmsnorm → block-align → [int16 matmul wire] → MTFP21 (down)
-    MTFP21: residual ADD
-    → mtfp21_to_float (ggml boundary)
+  FFN (multi-threaded gate+up, down):
+    float → shirley_rmsnorm_quantize → int8                [thread 0]
+    int8 × 2bit → sign_epi8 gate+up matmuls → int32       [ALL threads]
+    int32 → rescale → int8                                  [thread 0]
+    int8: ReLU (max_epi8), square (mullo_epi16)            [thread 0]
+    int16 × int8 → int32 → shift → int16 → requantize     [thread 0]
+    int8 → shirley_rmsnorm_ternary → int8 (417ns, Q14)    [thread 0]
+    int8 × 2bit → sign_epi8 down matmul → float           [ALL threads]
+    float: residual ADD                                     [thread 0]
 
-LM head (float32)
+LM head: float32 matmul (ggml, 128K × 2560, memory-bound ~18ms)
+Output norm: MTFP21 scalar RMSNorm (single-threaded)
 ```
 
-The int16 exists ONLY at the matmul SIMD wire (`sign_epi16`). Everything else is native MTFP21. The between-matmul trivials (ReLU, square, multiply) are 3 MTFP21 function calls — no conversion, no parallel arrays, no intermediate formats.
-
-### Speed: 4.57 tok/s
+### Speed: ~18-20 tok/s (4 threads, clean system)
 
 | Milestone | tok/s | Change |
 |-----------|-------|--------|
-| Scalar MTFP21 baseline | 2.14 | — |
+| Scalar MTFP21 baseline | 2.14 | -- |
 | + SIMD matmul + RMSNorm | 3.82 | +79% |
 | + FFN multi-threading | 4.33 | +13% |
 | + Native MTFP21 trivials | 4.57 | +5.5% |
-| Total improvement | | **+114%** |
+| + Kernel integration (sign_epi8) | 5.13 | +12% |
+| + Multi-threaded attention QKV+wo | 18.89 | **+268%** |
+| + Head-parallel body | 18.89 | structural |
+| Baseline BitNet (same model, stock) | ~22 | target |
+
+### Time Budget Per Token (~50ms at 20 tok/s)
+
+| Component | ms | % | Notes |
+|-----------|-----|---|-------|
+| LM head (f16 float GEMV) | ~18 | 36% | 128K x 2560, memory-bound, shared with baseline |
+| FFN (30 layers) | ~22 | 44% | gate+up 51%, trivials 22%, down 22%, sub_norm 3% |
+| Attention (30 layers) | ~6 | 12% | QKV 53%, wo 33%, body 4% (grows with seq_len) |
+| ggml overhead | ~4 | 8% | dispatch, thread pool, embedding |
 
 ### What's Done
 
 - **MTFP arithmetic:** 109/109 tests
-- **MTFP16 matmul kernel:** sign_epi16 × 2-bit ternary, batched normalization
-- **Chunked MTFP21 dot product:** 8-wide SIMD with per-element exponents
-- **SIMD RMSNorm:** chunked sum-of-squares + vectorized scale×gamma
-- **Native MTFP21 trivials:** mtfp21_relu, mtfp21_square, mtfp21_elem_mul — no conversion
-- **FFN multi-threading:** gate+up and down matmuls across 6 threads
-- **All constants precomputed as MTFP21:** gamma, eps, kq_scale, RoPE tables, KV cache
-- **Generation:** 3/3 core prompts correct, 7/7 extended prompts verified
+- **Kernel-based pipeline:** sign_epi8 matmuls (32 lanes) for all 7 ternary matmuls per layer
+- **Multi-threaded attention:** QKV+wo matmuls partitioned across all threads
+- **Multi-threaded FFN:** gate+up and down matmuls partitioned across all threads
+- **AVX2 trivials:** rescale_i32_to_i8, relu_i8 (max_epi8), square_i8_to_i16, requantize_i16_to_i8
+- **shirley_rmsnorm_quantize:** fused float->int8 norm+gamma+quantize for matmul input
+- **shirley_rmsnorm_ternary:** int8->int8 norm (417ns, Q14 gamma, zero float) for FFN sub_norm
+- **Adaptive barrier (shirley_barrier.h):** _mm_pause() spin-waits, monotonic phase support
+- **Float attention body:** RoPE, Q@K^T, softmax, attn@V in float (hardware FPU)
+- **Precomputed MTFP21 tables:** RoPE sin/cos, gamma, eps, kq_scale
+- **KV cache:** float (reinterpret-cast of MTFP21 int32 arrays)
+- **Profile instrumentation:** per-phase timing with SP_START/SP_LAP/SP_TOKEN
 
 ### What Remains
 
-**1. Attention multi-threading**
-The split-node approach (commit `85a616e`) has a regression — tested correctly during the session it was built but fails on subsequent runs. Likely a build artifact or initialization issue. The single-threaded attention works correctly. This needs independent debugging with a clean-room rebuild.
+**1. Head-parallel attention body (REVERTED)**
+Threading Q@K^T + softmax + attn@V across heads hangs at seq_len ~22. Root cause undiagnosed -- not a data race in the output (head slices don't overlap), not the barrier pattern (same pattern works for matmuls), not the AVX trivials (scalar path also hangs). Needs debugging on a quiet system with debug prints. Currently reverted to thread 0.
 
-**2. Model boundary float32**
-- Embedding lookup (float32 table → mtfp21_from_float)
-- LM head matmul (mtfp21_to_float → float32 logits)
-- ggml boundary conversions (60× per token)
-Blocked by the ggml embedding memory access issue.
+**2. FFN trivials threading**
+The relu->square->multiply->requantize chain is 22% of FFN time, entirely single-threaded. Threading adds an extra barrier that costs more than it saves at n_ff=6912. The rescale ops need a global max (parallel reduction), which requires yet another barrier. Not profitable at this dimension size.
 
-**3. Performance optimization**
-- The ternary matmul (`shirley_gemv_mtfp16`) is ~30% of total time and already multi-threaded
-- The MTFP21 scalar ops (relu, square, mul, RMSNorm rsqrt, softmax exp) are the next targets
-- The ggml boundary conversions are ~10% of time (structural)
+**3. Barrier optimization**
+300 spin-wait barriers per token. Each barrier causes L1 cache line bouncing across cores. Futex-based barriers eliminate the spin but have a phase-cycling race (thread misses a 0->1 transition). sched_yield() causes 1-10ms reschedule delays on loaded systems. Current solution: _mm_pause() spin-wait (reduces power and pipeline stalls, doesn't eliminate cache contention).
+
+**4. LM head dominates at 36% of per-token time**
+128,256 x 2,560 float GEMV against f16 embedding table. Memory-bandwidth-bound (~0.61 GB read per token). Both Shirley and baseline pay this equally. Not actionable without model architecture changes.
+
+**5. Model boundary float32**
+- Embedding lookup (float32 table)
+- LM head (float32 matmul)
+- Output norm (MTFP21 scalar, single-threaded)
+- ggml boundary conversions (60x per token)
+
+**6. KV cache format**
+Stores float in reinterpreted int32 arrays. The exp arrays are allocated but unused (wasted memory). Should either commit to float storage or convert to native MTFP21.
 
 ### Retracted Claims
 
-The 5.27 tok/s claim from the split-node attention commit (`85a616e`) is **unverified**. The binary that produced it may have been stale. The split-node code produces corrupted output on fresh builds. The reliable speed is 4.57 tok/s.
+- The 5.27 tok/s claim from split-node attention (85a616e) was RETRACTED (stale binary).
+- Head-parallel attention body was reverted due to unexplained hang at seq_len ~22.
+
+### Known Bugs
+
+- **Phase overflow:** Monotonic phase counter overflows int32 after ~10M tokens (INT_MAX / 210 per token = ~142 hours continuous generation). Not a concern for interactive use.
+- **Head-parallel hang:** Attention body partitioned across heads hangs deterministically at sequence position ~22-23 with 4 threads. Works with 1 or 2 threads. Root cause unknown.
 
 ## Lessons
 
-1. **Native MTFP21 between matmuls.** No format conversion. The kernels exist — use them.
-2. **The int16 is a wire format.** It exists for sign_epi16 at the matmul boundary. Nowhere else.
-3. **Conversion overhead > compute overhead.** Touching 220 KB to convert formats costs more than 13K scalar MTFP21 multiplies on 166 KB of data.
-4. **Test on fresh builds.** Stale binaries produce false positives. Rebuild and retest after every commit.
-5. **The LMM finds what incremental debugging doesn't.** The split-node insight came from the manifold. The native trivials insight came from Tripp asking "why are we converting?"
+1. **sign_epi8 at 32 lanes is the production matmul.** Not sign_epi16. The 32-lane kernel is what ggml_gemv_i2_i8_s uses.
+2. **Threading the matmuls is the big win.** 5->19 tok/s from partitioning QKV+wo+gate+up+down across threads.
+3. **Don't thread small arrays.** FFN trivials at n_ff=6912 are too small for profitable threading -- barrier overhead > compute savings.
+4. **_mm_pause() in spin-waits is mandatory.** Without it, spinning threads pollute L1 cache and waste power. With it, ~10x power reduction per spin iteration.
+5. **sched_yield() is poison on loaded systems.** 1-10ms reschedule delays compound across 300+ barriers per token.
+6. **The LM head is 36% of time and untouchable.** Memory-bandwidth-bound. Both Shirley and baseline pay it.
+7. **mullo_epi16 overflows silently.** sq (max 6400) x up (max 80) = 512000, doesn't fit in int16. Must widen to int32 before multiply.
+8. **Test at 32+ tokens.** Bugs that don't manifest at 8 tokens can hang at 12.

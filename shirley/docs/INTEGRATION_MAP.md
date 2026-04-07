@@ -358,22 +358,25 @@ O3: Sampling
     Priority: MEDIUM — can reuse A10's softmax
 ```
 
-## Integration Scorecard (2026-04-02)
+## Integration Scorecard (2026-04-06)
 
 | Category | Status | Notes |
 |----------|--------|-------|
-| Ternary matmul (sign_epi16) | **COMPLETE** | 210 matmuls, zero float, MTFP16 wire |
-| Attention custom op | **COMPLETE** | norm+QKV+RoPE+attn+sub_norm+wo+residual |
-| FFN custom op | **COMPLETE** | norm+gate/up+relu²+mul+sub_norm+down+residual |
-| Output norm | **COMPLETE** | MTFP21 RMSNorm |
+| Ternary matmul (sign_epi8) | **COMPLETE** | 210 matmuls, 32 lanes, multi-threaded |
+| Attention custom op | **COMPLETE** | MT QKV+wo, float body, ~6ms/tok |
+| FFN custom op | **COMPLETE** | MT gate+up+down, AVX2 trivials, ~22ms/tok |
+| Attention multi-threading | **COMPLETE** | QKV+wo partitioned across all threads |
+| FFN multi-threading | **COMPLETE** | gate+up and down partitioned across all threads |
+| Head-parallel attn body | **REVERTED** | Hangs at seq_len ~22, undiagnosed |
+| Barrier optimization | **IN PROGRESS** | _mm_pause spin-waits; futex deadlocks, yield too slow |
+| Output norm | **COMPLETE** | MTFP21 RMSNorm (single-threaded) |
 | MTFP21 arithmetic | **COMPLETE** | 109/109 tests (rsqrt, exp, softmax, cmp) |
 | MTFP16 matmul kernel | **COMPLETE** | shirley_mtfp16_matmul.h, 6/6 tests |
-| Embedding lookup | **REMAINING** | float32 table, blocked by memory access issue |
-| LM head matmul | **REMAINING** | float32, blocked by shape + memory access |
-| KV cache | **REMAINING** | stores float, should store MTFP21 |
-| RoPE tables | **REMAINING** | stores float, should store MTFP21 |
+| Embedding lookup | **REMAINING** | float32 table |
+| LM head matmul | **REMAINING** | float32, 36% of per-token time, memory-bound |
+| KV cache | **REMAINING** | stores float in reinterpreted int32 arrays |
 
-**Core pipeline: COMPLETE. Remaining work is at model boundaries.**
+**Core pipeline: COMPLETE. Multi-threaded. ~18-20 tok/s vs 22 tok/s baseline.**
 
 ## The Critical Path
 

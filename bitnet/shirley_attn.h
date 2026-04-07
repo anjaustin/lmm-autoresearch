@@ -76,12 +76,13 @@ struct shirley_attn_params {
     /* Threading workspace */
     volatile int mt_phase;
     volatile int mt_threads_done;
-    int16_t * mt_act;         /* shared block-aligned activations */
-    int8_t    mt_bexp;
-    void    * mt_qkv;         /* mtfp21_t[n_embd + kv_dim + kv_dim] for Q,K,V */
-    int16_t * mt_wo_act;      /* block-aligned for wo matmul */
-    int8_t    mt_wo_bexp;
-    void    * mt_wo_out;      /* mtfp21_t[n_embd] */
+    int8_t  * mt_act_i8;      /* shared int8 activations for QKV matmul [n_embd] */
+    float   * mt_q_f;         /* shared float output for Q matmul [n_embd] */
+    float   * mt_k_f;         /* shared float output for K matmul [kv_dim] */
+    float   * mt_v_f;         /* shared float output for V matmul [kv_dim] */
+    float   * mt_attn_out;    /* shared attention output [n_embd] for head-parallel body */
+    int8_t  * mt_sub_i8;      /* shared int8 activations for wo matmul [n_embd] */
+    float   * mt_wo_f;        /* shared float output for wo matmul [n_embd] */
 
     int ready;
 };

@@ -65,6 +65,9 @@ struct shirley_ffn_params {
     int16_t * mt_sub_act;
     int8_t    mt_sub_bexp;
     volatile int mt_threads_done;
+    volatile int32_t mt_gate_max;  /* shared max_abs for gate rescale */
+    volatile int32_t mt_up_max;    /* shared max_abs for up rescale */
+    volatile int mt_threads_done2; /* second barrier counter for trivials */
 
     int ready;
 };

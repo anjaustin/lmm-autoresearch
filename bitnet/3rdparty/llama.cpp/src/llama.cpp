@@ -15468,7 +15468,7 @@ struct llm_build_context {
             // self-attention — Shirley MTFP21 custom op
             // Includes: attn_norm + QKV + RoPE + attention + sub_norm + wo + scale + RESIDUAL ADD
             cur = ggml_map_custom1(ctx0, inpL,
-                shirley_attn_compute, 1,
+                shirley_attn_compute, GGML_N_TASKS_MAX,
                 &shirley_attn_layer_params[il]);
             cb(cur, "ffn_inp", il);
 

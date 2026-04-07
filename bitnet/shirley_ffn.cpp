@@ -24,6 +24,7 @@
 #include "3rdparty/llama.cpp/ggml/include/ggml.h"
 #include "shirley_ffn.h"
 #include "shirley_profile.h"
+#include "shirley_barrier.h"
 
 /* ================================================================
  *  MTFP16 type and conversions (inline for this file)
@@ -200,20 +201,22 @@ void shirley_ffn_compute(
     const int n_tokens = (int)a->ne[1];
     float * output = (float *)dst->data;
 
+    /* Phase managed per-token: 0 → 1 (norm) → 3 (trivials) → 0 (done) */
+
     for (int tok = 0; tok < n_tokens; tok++) {
         const float * input = (const float *)a->data + tok * n;
         float * out_tok = output + tok * n;
 
-        SP_START; /* starts timer for all threads, only thread 0 uses SP_LAP */
+        SP_START;
 
-        /* ---- PHASE 0: RMSNorm → int8 via shirley_rmsnorm_quantize (thread 0) ---- */
+        /* ---- RMSNorm → int8 (thread 0) ---- */
         if (ith == 0) {
             shirley_rmsnorm_quantize(
                 (int8_t *)p->w_act, input, p->ffn_norm_gamma_f32, n, p->eps, 80);
             SP_LAP(ffn_norm);
             __atomic_store_n(&p->mt_phase, 1, __ATOMIC_RELEASE);
         } else {
-            while (__atomic_load_n(&p->mt_phase, __ATOMIC_ACQUIRE) < 1) {}
+            while (__atomic_load_n(&p->mt_phase, __ATOMIC_ACQUIRE) < 1) { _mm_pause(); }
         }
 
         /* ---- PHASE 1: Gate + Up matmul — sign_epi8, 32 lanes (ALL threads) ---- */
@@ -222,7 +225,6 @@ void shirley_ffn_compute(
             int r0 = ith * rows_per;
             int r1 = r0 + rows_per; if (r1 > n_ff) r1 = n_ff;
             if (r0 < r1) {
-                /* Gate: our partition */
                 float gate_tmp[r1 - r0]; /* VLA */
                 ggml_gemv_i2_i8_s(n, gate_tmp, r1 - r0,
                     (const char *)p->gate_data + (int64_t)r0 * (n / 4),
@@ -231,7 +233,6 @@ void shirley_ffn_compute(
                 for (int i = 0; i < r1 - r0; i++) {
                     p->mt_gate_raw[r0 + i] = (int32_t)(gate_tmp[i] * gate_cs);
                 }
-                /* Up: our partition */
                 float up_tmp[r1 - r0]; /* VLA */
                 ggml_gemv_i2_i8_s(n, up_tmp, r1 - r0,
                     (const char *)p->up_data + (int64_t)r0 * (n / 4),
@@ -245,28 +246,22 @@ void shirley_ffn_compute(
 
         __atomic_fetch_add(&p->mt_threads_done, 1, __ATOMIC_ACQ_REL);
         if (ith == 0) {
-            while (__atomic_load_n(&p->mt_threads_done, __ATOMIC_ACQUIRE) < nth) {}
+            while (__atomic_load_n(&p->mt_threads_done, __ATOMIC_ACQUIRE) < nth) { _mm_pause(); }
             __atomic_store_n(&p->mt_threads_done, 0, __ATOMIC_RELEASE);
             SP_LAP(ffn_gate_up);
 
-            /* ---- PHASE 2: Trivials — AVX2 kernels ---- */
-            /* Rescale gate raw → int8 */
+            /* ---- PHASE 2: Trivials — AVX2 kernels (thread 0) ---- */
             shirley_rescale_i32_to_i8(p->mt_gate_i8, p->mt_gate_raw, n_ff, 80);
-            /* Rescale up raw → int8 */
             shirley_rescale_i32_to_i8(p->mt_up_i8, p->mt_up_raw, n_ff, 80);
-
-            /* ReLU: 32 lanes, one AVX2 instruction */
             shirley_relu_i8(p->mt_gate_i8, p->mt_gate_i8, n_ff);
 
-            /* Square: int8 → int16, AVX2 */
             int16_t sq[n_ff]; /* VLA */
             shirley_square_i8_to_i16(sq, p->mt_gate_i8, n_ff);
 
-            /* gate² × up: int16 × int8 → int16, then requantize to int8 */
+            /* gate² × up: int16 × int8 → int32 → >>7 → int16 */
             int16_t prod[n_ff]; /* VLA */
             for (int i = 0; i < n_ff; i++) {
                 int32_t p32 = (int32_t)sq[i] * (int32_t)p->mt_up_i8[i];
-                /* Scale down to int16 range. Max: 6400 × 80 = 512000. >>7 = 4000. */
                 prod[i] = (int16_t)(p32 >> 7);
             }
             shirley_requantize_i16_to_i8(p->mt_trivials_i8, prod, n_ff, 80);
@@ -281,7 +276,7 @@ void shirley_ffn_compute(
 
             __atomic_store_n(&p->mt_phase, 3, __ATOMIC_RELEASE);
         } else {
-            while (__atomic_load_n(&p->mt_phase, __ATOMIC_ACQUIRE) < 3) {}
+            while (__atomic_load_n(&p->mt_phase, __ATOMIC_ACQUIRE) < 3) { _mm_pause(); }
         }
 
         /* ---- PHASE 4: Down matmul — sign_epi8, 32 lanes (ALL threads) ---- */
@@ -303,11 +298,10 @@ void shirley_ffn_compute(
 
         __atomic_fetch_add(&p->mt_threads_done, 1, __ATOMIC_ACQ_REL);
         if (ith == 0) {
-            while (__atomic_load_n(&p->mt_threads_done, __ATOMIC_ACQUIRE) < nth) {}
+            while (__atomic_load_n(&p->mt_threads_done, __ATOMIC_ACQUIRE) < nth) { _mm_pause(); }
             __atomic_store_n(&p->mt_threads_done, 0, __ATOMIC_RELEASE);
             SP_LAP(ffn_down);
 
-            /* ---- PHASE 5: Residual + output ---- */
             float * down_f = (float *)p->mt_down;
             for (int i = 0; i < n; i++) {
                 out_tok[i] = down_f[i] + input[i];
@@ -317,7 +311,7 @@ void shirley_ffn_compute(
 
             __atomic_store_n(&p->mt_phase, 0, __ATOMIC_RELEASE);
         } else {
-            while (__atomic_load_n(&p->mt_phase, __ATOMIC_ACQUIRE) != 0) {}
+            while (__atomic_load_n(&p->mt_phase, __ATOMIC_ACQUIRE) != 0) { _mm_pause(); }
         }
     }
 
@@ -403,6 +397,9 @@ void shirley_ffn_params_init(
     p->mt_up_i8     = (int8_t  *)malloc(n_ff * sizeof(int8_t));
     p->mt_trivials_i8 = (int8_t *)malloc(n_ff * sizeof(int8_t));
     p->mt_sub_act = (int16_t  *)malloc(n_ff * sizeof(int16_t));
+    p->mt_gate_max = 0;
+    p->mt_up_max = 0;
+    p->mt_threads_done2 = 0;
 
     p->ready = 1;
 
