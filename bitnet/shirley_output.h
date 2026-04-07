@@ -22,14 +22,21 @@ struct shirley_output_params {
     int8_t  eps_exp;
     int32_t * output_norm_gamma_mant;  /* [n_embd] — precomputed MTFP21 */
     int8_t  * output_norm_gamma_exp;
+    const float * output_norm_gamma_f32; /* float for shirley_rmsnorm_quantize */
 
-    /* Embedding table converted to MTFP21 at model load.
-     * Layout: [vocab_size][n_embd] as mtfp21_t structs.
-     * Each entry is a position in the geometric space. */
-    void * embd_mtfp21;   /* mtfp21_t[vocab_size * n_embd], lazy-converted */
+    /* MTFP10 embedding table: block-aligned int16 mantissas + per-row exponent.
+     * Converted from f16 at model load. Same memory footprint as f16.
+     * Used by the LM head GEMV — int16 × int16 → int32 dot products. */
+    int16_t * embd_mtfp10;   /* [vocab_size * n_embd] block-aligned int16 */
+    int8_t  * embd_row_exp;  /* [vocab_size] per-row block exponent */
 
-    /* For lazy conversion — tensor stored at init, data read at first compute */
-    const void * _tok_embd_tensor;  /* struct ggml_tensor * (opaque to avoid include) */
+    /* Legacy fields — kept for compatibility */
+    void * embd_mtfp21;
+    const void * _tok_embd_tensor;
+
+    /* Threading */
+    volatile int mt_phase;
+    volatile int mt_threads_done;
 
     int ready;
 };

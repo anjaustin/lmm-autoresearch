@@ -15494,8 +15494,13 @@ struct llm_build_context {
             shirley_output_compute, 1, &shirley_output_p);
         cb(cur, "result_norm", -1);
 
-        // LM head — ggml float matmul (output boundary)
-        cur = llm_build_lora_mm(lctx, ctx0, model.tok_embd, cur);
+        // LM head — Shirley MTFP10 int16 GEMV
+        {
+            struct ggml_tensor * lm_out = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
+                model.tok_embd->ne[1], cur->ne[1]); /* [vocab_size, n_tokens] */
+            cur = ggml_map_custom2(ctx0, lm_out, cur,
+                shirley_lmhead_compute, GGML_N_TASKS_MAX, &shirley_output_p);
+        }
 
         cb(cur, "result_output", -1);
 

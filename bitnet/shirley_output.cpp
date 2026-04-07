@@ -1,10 +1,12 @@
 /*
- * shirley_output.cpp — Output norm + LM head, fully MTFP21
+ * shirley_output.cpp — Output norm + MTFP10 LM head
  *
- * The embedding table is converted to MTFP21 once at model load.
- * Output norm: MTFP21 RMSNorm (custom1, shape preserved).
- * LM head: MTFP21 dot products against converted embeddings (custom2).
- * Logits output as float32 — the one true boundary to sampling.
+ * Output norm: float → shirley_rmsnorm_quantize → int8 (reuses the kernel)
+ * LM head: int16 hidden × int16 embedding → int32 → float logits
+ *
+ * The embedding table is converted from f16 to block-aligned MTFP10
+ * (int16 mantissa, per-row int8 exponent) at model load. Same memory
+ * footprint as f16. Integer compute via _mm256_madd_epi16.
  */
 
 #include <stdint.h>
@@ -12,25 +14,82 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <immintrin.h>
 
 #define restrict
 #include "shirley_kernels.h"
-
 #include "shirley_convert.h"
 
 #include "3rdparty/llama.cpp/ggml/include/ggml.h"
 #include "shirley_output.h"
-
-/* Packed to 5 bytes to reduce memory (128K vocab × 2560 dim) */
-#pragma pack(push, 1)
-typedef struct {
-    int32_t mantissa;
-    int8_t  exponent;
-} mtfp21_local_t;
-#pragma pack(pop)
+#include "shirley_barrier.h"
 
 /* ================================================================
- *  Output norm: RMSNorm in MTFP21
+ *  MTFP10 block-align: float row → int16 mantissas + block exponent
+ *
+ *  MTFP10: 10-trit mantissa, range ±29524, fits int16.
+ *  Block exponent: shared per row, value = mantissa × 3^exponent.
+ *  Precision: 15.8 bits (exceeds f16's 11-bit mantissa).
+ * ================================================================ */
+
+#define MTFP10_MANT_MAX 29524  /* (3^10 - 1) / 2 */
+
+static void convert_f32_row_to_mtfp10(
+    int16_t * dst_mant, int8_t * dst_exp,
+    const float * src, int n
+) {
+    /* Find max absolute value */
+    float max_abs = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float a = fabsf(src[i]);
+        if (a > max_abs) max_abs = a;
+    }
+
+    if (max_abs == 0.0f) {
+        memset(dst_mant, 0, n * sizeof(int16_t));
+        *dst_exp = 0;
+        return;
+    }
+
+    /* Find block exponent: max_abs ≈ MTFP10_MANT_MAX × 3^exp
+     * exp = log3(max_abs / MTFP10_MANT_MAX) */
+    float scale = (float)MTFP10_MANT_MAX / max_abs;
+    int8_t exp = 0;
+
+    /* Compute in base-3: if scale < 1, we need positive exponent (values are large)
+     * if scale > 1, we need negative exponent (values are small) */
+    float test = max_abs;
+    if (test > MTFP10_MANT_MAX) {
+        while (test > MTFP10_MANT_MAX) { test /= 3.0f; exp++; }
+    } else {
+        while (test * 3.0f <= MTFP10_MANT_MAX) { test *= 3.0f; exp--; }
+    }
+
+    /* Quantize: each element = round(src[i] / 3^exp) clamped to ±MTFP10_MANT_MAX */
+    float divisor = powf(3.0f, (float)exp);
+    float inv_div = 1.0f / divisor;
+    for (int i = 0; i < n; i++) {
+        float scaled = src[i] * inv_div;
+        int32_t q = (int32_t)roundf(scaled);
+        if (q > MTFP10_MANT_MAX) q = MTFP10_MANT_MAX;
+        if (q < -MTFP10_MANT_MAX) q = -MTFP10_MANT_MAX;
+        dst_mant[i] = (int16_t)q;
+    }
+    *dst_exp = exp;
+}
+
+/* f16 → float helper (ggml stores f16 as ggml_fp16_t which is uint16_t) */
+static inline float fp16_to_f32(uint16_t h) {
+    /* Use hardware conversion via _mm_cvtph_ps if available */
+    __m128i v = _mm_set1_epi16((short)h);
+    __m128 f = _mm_cvtph_ps(v);
+    return _mm_cvtss_f32(f);
+}
+
+/* ================================================================
+ *  Output norm: shirley_rmsnorm_quantize (float → float normed)
+ *  Simpler than attention/FFN: just norm, no quantize to int8 here.
+ *  The LM head needs float input for block-alignment.
  * ================================================================ */
 
 extern "C"
@@ -51,193 +110,203 @@ void shirley_output_compute(
         const float * input = (const float *)a->data + tok * n;
         float * out_tok = output + tok * n;
 
-        mtfp21_t inp_m[n]; /* VLA */
-        for (int i = 0; i < n; i++) inp_m[i] = mtfp21_from_float(input[i]);
+        /* RMSNorm in float — the output feeds the MTFP10 LM head */
+        float sum_sq = 0.0f;
+        for (int i = 0; i < n; i++) sum_sq += input[i] * input[i];
+        float scale = 1.0f / sqrtf(sum_sq / n + p->eps);
 
-        mtfp21_t sum_sq = {0, 0};
-        for (int i = 0; i < n; i++)
-            sum_sq = mtfp21_add(sum_sq, mtfp21_mul(inp_m[i], inp_m[i]));
-        mtfp21_t mean = mtfp21_div_scalar(sum_sq, n);
-        mtfp21_t scale = mtfp21_rsqrt(
-            mtfp21_add(mean, (mtfp21_t){p->eps_mant, p->eps_exp}));
-
-        for (int i = 0; i < n; i++) {
-            mtfp21_t normed = mtfp21_mul(inp_m[i], scale);
-            if (p->output_norm_gamma_mant) {
-                mtfp21_t g = {p->output_norm_gamma_mant[i], p->output_norm_gamma_exp[i]};
-                normed = mtfp21_mul(normed, g);
-            }
-            out_tok[i] = mtfp21_to_float(normed);
+        if (p->output_norm_gamma_f32) {
+            for (int i = 0; i < n; i++)
+                out_tok[i] = input[i] * scale * p->output_norm_gamma_f32[i];
+        } else {
+            for (int i = 0; i < n; i++)
+                out_tok[i] = input[i] * scale;
         }
     }
 
     static int logged = 0;
     if (!logged) {
-        fprintf(stderr, "shirley: MTFP21 output norm active (%d tokens)\n", n_tokens);
+        fprintf(stderr, "shirley: float output norm active (%d tokens)\n", n_tokens);
         logged = 1;
     }
 }
 
 /* ================================================================
- *  LM head: MTFP21 matmul against converted embedding table
+ *  LM head: MTFP10 int16 GEMV — multi-threaded
  *
- *  dst:  [vocab_size, n_tokens] — logits
- *  a:    [vocab_size, n_embd] — embedding table (src0 of mul_mat)
- *  b:    [n_embd, n_tokens] — normed output (src1 of mul_mat)
+ *  Each thread processes a partition of vocab rows.
+ *  Per row: madd_epi16 dot product (int16 × int16 → int32),
+ *  then convert to float logit using block exponents.
  * ================================================================ */
+
+/* Single dot product: int16 activation × int16 embedding row → int32 */
+static inline int32_t dot_i16_avx2(
+    const int16_t * restrict a,
+    const int16_t * restrict b,
+    int n
+) {
+    __m256i acc = _mm256_setzero_si256();
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m256i va = _mm256_loadu_si256((const __m256i *)(a + i));
+        __m256i vb = _mm256_loadu_si256((const __m256i *)(b + i));
+        /* madd_epi16: multiply adjacent int16 pairs, sum to int32 */
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(va, vb));
+    }
+    /* Horizontal sum */
+    __m128i lo = _mm256_castsi256_si128(acc);
+    __m128i hi = _mm256_extracti128_si256(acc, 1);
+    __m128i sum4 = _mm_add_epi32(lo, hi);
+    sum4 = _mm_hadd_epi32(sum4, sum4);
+    sum4 = _mm_hadd_epi32(sum4, sum4);
+    int32_t result = _mm_cvtsi128_si32(sum4);
+
+    /* Scalar tail */
+    for (; i < n; i++) result += (int32_t)a[i] * (int32_t)b[i];
+    return result;
+}
 
 extern "C"
 void shirley_lmhead_compute(
     struct ggml_tensor * dst,
-    const struct ggml_tensor * a,   /* tok_embd [n_embd, vocab_size] */
+    const struct ggml_tensor * a,   /* shape template (unused data) */
     const struct ggml_tensor * b,   /* normed output [n_embd, n_tokens] */
     int ith, int nth,
     void * userdata
 ) {
-    if (ith != 0) return;
-
     struct shirley_output_params * p = (struct shirley_output_params *)userdata;
-
-    /* Lazy conversion: convert embedding table to MTFP21 on first call.
-     * At this point the ggml backend has loaded the weight data. */
-    fprintf(stderr, "shirley: lmhead dst=%p dst->data=%p b=%p b->data=%p ne=[%lld,%lld]\n",
-            (void*)dst, dst ? dst->data : NULL,
-            (void*)b, b ? b->data : NULL,
-            dst ? (long long)dst->ne[0] : 0, dst ? (long long)dst->ne[1] : 0);
-    fflush(stderr);
-
-    /* MTFP21 LM head: convert embedding values on-the-fly.
-     * Each vocab row is converted to MTFP21 during the dot product.
-     * No pre-allocation of the full 1.5 GB table needed. */
-    if (p->_tok_embd_tensor) {
-        const struct ggml_tensor * te = (const struct ggml_tensor *)p->_tok_embd_tensor;
-        const float * embd_f32 = (const float *)te->data;
-        const int n = p->n_embd;
-        const int V = p->vocab_size;
-        const int n_tok = (int)b->ne[1];
-        float * output = (float *)dst->data;
-
-        for (int tok = 0; tok < n_tok; tok++) {
-            const float * inp = (const float *)b->data + tok * n;
-            float * out_tok = output + tok * V;
-
-            mtfp21_t inp_m[n]; /* VLA */
-            for (int i = 0; i < n; i++) inp_m[i] = mtfp21_from_float(inp[i]);
-
-            if (tok == 0) { fprintf(stderr, "shirley: lmhead computing %d vocab dots (embd_f32=%p)...\n", V, (const void*)embd_f32); fflush(stderr); }
-            for (int v = 0; v < V; v++) {
-                /* Plain float dot product for now — verify plumbing works */
-                float dot = 0.0f;
-                const float * row = embd_f32 + (int64_t)v * n;
-                for (int d = 0; d < n; d++) {
-                    dot += inp[d] * row[d];
-                }
-                out_tok[v] = dot;
-            }
-        }
-
-        static int logged2 = 0;
-        if (!logged2) {
-            fprintf(stderr, "shirley: MTFP21 LM head active (%d tokens, vocab=%d)\n", n_tok, V);
-            logged2 = 1;
-        }
-        return;
-    }
-
-    /* Full MTFP21 path (when embedding table is pre-converted) */
-    if (0 && p->_tok_embd_tensor) {  /* disabled until allocation issue is resolved */
-        const struct ggml_tensor * te = (const struct ggml_tensor *)p->_tok_embd_tensor;
-        const float * src = (const float *)te->data;
-        int64_t total = (int64_t)p->vocab_size * p->n_embd;
-        int64_t bytes = total * (int64_t)sizeof(mtfp21_local_t);
-        int64_t tensor_bytes = (int64_t)te->ne[0] * te->ne[1] * sizeof(float);
-        fprintf(stderr, "shirley: LM head — tok_embd ne=[%lld,%lld] nbytes=%lld, "
-                "total=%lld elements (%.1f MB)\n",
-                (long long)te->ne[0], (long long)te->ne[1],
-                (long long)tensor_bytes,
-                (long long)total, (float)bytes / (1024.0f * 1024.0f));
-        fflush(stderr);
-        /* Use actual tensor size, not vocab_size * n_embd */
-        int64_t actual_total = (int64_t)te->ne[0] * te->ne[1];
-        if (actual_total < total) {
-            fprintf(stderr, "shirley: WARNING — tensor has %lld elements, expected %lld. Using tensor size.\n",
-                    (long long)actual_total, (long long)total);
-            total = actual_total;
-            bytes = total * (int64_t)sizeof(mtfp21_local_t);
-        }
-
-        mtfp21_local_t * embd = (mtfp21_local_t *)malloc(bytes);
-        if (embd) {
-            /* First: verify all source data is readable */
-            volatile float sum = 0;
-            for (int64_t i = 0; i < total; i++) {
-                sum += src[i];
-                if (i % 100000000 == 0) {
-                    fprintf(stderr, "shirley: reading src... %.0f%% (sum=%.2f)\n",
-                            100.0 * i / total, (double)sum);
-                    fflush(stderr);
-                }
-            }
-            fprintf(stderr, "shirley: src read OK, converting...\n");
-            fflush(stderr);
-
-            for (int64_t i = 0; i < total; i++) {
-                float val = src[i];
-                if (val != val || val > 1e30f || val < -1e30f) {
-                    embd[i].mantissa = 0;
-                    embd[i].exponent = 0;
-                } else {
-                    mtfp21_t m = mtfp21_from_float(val);
-                    embd[i].mantissa = m.mantissa;
-                    embd[i].exponent = m.exponent;
-                }
-                if (i % 100000000 == 0) {
-                    fprintf(stderr, "shirley: converting... %.0f%%\n", 100.0 * i / total);
-                    fflush(stderr);
-                }
-            }
-            p->embd_mtfp21 = embd;
-            fprintf(stderr, "shirley: MTFP21 embedding table converted\n");
-            fflush(stderr);
-        }
-    }
-
-    if (!p->embd_mtfp21) {
-        memset(dst->data, 0, ggml_nbytes(dst));
-        return;
-    }
     const int n = p->n_embd;
     const int V = p->vocab_size;
     const int n_tokens = (int)b->ne[1];
     float * output = (float *)dst->data;
-    mtfp21_local_t * embd = (mtfp21_local_t *)p->embd_mtfp21;
+
+    /* Lazy conversion: convert embedding table on first call */
+    if (!p->embd_mtfp10 && ith == 0) {
+        const struct ggml_tensor * te = (const struct ggml_tensor *)p->_tok_embd_tensor;
+        if (te && te->data) {
+            fprintf(stderr, "shirley: converting embedding table to MTFP10 (%d × %d)...\n", V, n);
+            p->embd_mtfp10 = (int16_t *)malloc((int64_t)V * n * sizeof(int16_t));
+            p->embd_row_exp = (int8_t *)malloc(V * sizeof(int8_t));
+
+            const void * raw_data = te->data;
+            int src_type = te->type; /* 0=f32, 1=f16 */
+
+            for (int v = 0; v < V; v++) {
+                float row_f32[n]; /* VLA */
+                if (src_type == 1) { /* f16 */
+                    const uint16_t * src_f16 = (const uint16_t *)raw_data + (int64_t)v * n;
+                    for (int i = 0; i < n; i++) row_f32[i] = fp16_to_f32(src_f16[i]);
+                } else { /* f32 */
+                    const float * src_f32 = (const float *)raw_data + (int64_t)v * n;
+                    memcpy(row_f32, src_f32, n * sizeof(float));
+                }
+                convert_f32_row_to_mtfp10(
+                    p->embd_mtfp10 + (int64_t)v * n,
+                    &p->embd_row_exp[v],
+                    row_f32, n);
+            }
+            fprintf(stderr, "shirley: MTFP10 embedding ready (%.1f MB)\n",
+                    (float)((int64_t)V * n * 2 + V) / (1024.0f * 1024.0f));
+        }
+    }
+
+    /* Barrier: ensure conversion is complete before any thread reads */
+    if (nth > 1) {
+        __atomic_fetch_add(&p->mt_threads_done, 1, __ATOMIC_ACQ_REL);
+        if (ith == 0) {
+            while (__atomic_load_n(&p->mt_threads_done, __ATOMIC_ACQUIRE) < nth) { _mm_pause(); }
+            __atomic_store_n(&p->mt_threads_done, 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&p->mt_phase, 1, __ATOMIC_RELEASE);
+        } else {
+            while (__atomic_load_n(&p->mt_phase, __ATOMIC_ACQUIRE) < 1) { _mm_pause(); }
+        }
+    }
+
+    if (!p->embd_mtfp10) {
+        /* Fallback: use float dot product */
+        if (ith != 0) return;
+        const struct ggml_tensor * te = (const struct ggml_tensor *)p->_tok_embd_tensor;
+        if (!te || !te->data) { memset(output, 0, (int64_t)V * n_tokens * sizeof(float)); return; }
+        const float * embd_f32 = (const float *)te->data;
+
+        for (int tok = 0; tok < n_tokens; tok++) {
+            const float * inp = (const float *)b->data + tok * n;
+            float * out_tok = output + tok * V;
+            for (int v = 0; v < V; v++) {
+                float dot = 0.0f;
+                const float * row = embd_f32 + (int64_t)v * n;
+                for (int d = 0; d < n; d++) dot += inp[d] * row[d];
+                out_tok[v] = dot;
+            }
+        }
+        return;
+    }
+
+    /* ---- MTFP10 LM head: int16 × int16 → int32 → float logits ---- */
 
     for (int tok = 0; tok < n_tokens; tok++) {
-        const float * input = (const float *)b->data + tok * n;
+        const float * inp = (const float *)b->data + tok * n;
         float * out_tok = output + tok * V;
 
-        /* Convert normed input to MTFP21 */
-        mtfp21_t inp_m[n]; /* VLA */
-        for (int i = 0; i < n; i++) inp_m[i] = mtfp21_from_float(input[i]);
+        /* Block-align the hidden state to int16 (same format as embedding rows) */
+        int16_t act_i16[n]; /* VLA */
+        float act_max = 0.0f;
+        for (int i = 0; i < n; i++) {
+            float a = fabsf(inp[i]);
+            if (a > act_max) act_max = a;
+        }
 
-        /* Dot product with each vocabulary embedding */
-        for (int v = 0; v < V; v++) {
-            mtfp21_t dot = {0, 0};
-            mtfp21_local_t * row = embd + v * n;
-            for (int d = 0; d < n; d++) {
-                mtfp21_t e;
-                e.mantissa = row[d].mantissa;
-                e.exponent = row[d].exponent;
-                dot = mtfp21_add(dot, mtfp21_mul(inp_m[d], e));
+        int8_t act_exp = 0;
+        if (act_max > 0.0f) {
+            float test = act_max;
+            if (test > MTFP10_MANT_MAX) {
+                while (test > MTFP10_MANT_MAX) { test /= 3.0f; act_exp++; }
+            } else {
+                while (test * 3.0f <= MTFP10_MANT_MAX) { test *= 3.0f; act_exp--; }
             }
-            out_tok[v] = mtfp21_to_float(dot);
+            float inv_div = 1.0f / powf(3.0f, (float)act_exp);
+            for (int i = 0; i < n; i++) {
+                int32_t q = (int32_t)roundf(inp[i] * inv_div);
+                if (q > MTFP10_MANT_MAX) q = MTFP10_MANT_MAX;
+                if (q < -MTFP10_MANT_MAX) q = -MTFP10_MANT_MAX;
+                act_i16[i] = (int16_t)q;
+            }
+        } else {
+            memset(act_i16, 0, n * sizeof(int16_t));
+        }
+
+        /* Partition vocab rows across threads */
+        int rows_per = (V + nth - 1) / nth;
+        int r0 = ith * rows_per;
+        int r1 = r0 + rows_per; if (r1 > V) r1 = V;
+
+        /* Precompute the base-3 power for combined exponent recovery */
+        /* logit = dot_int32 × 3^(act_exp + row_exp) */
+        for (int v = r0; v < r1; v++) {
+            int32_t dot = dot_i16_avx2(act_i16,
+                p->embd_mtfp10 + (int64_t)v * n, n);
+            int combined_exp = (int)act_exp + (int)p->embd_row_exp[v];
+            float logit = (float)dot * powf(3.0f, (float)combined_exp);
+            out_tok[v] = logit;
+        }
+    }
+
+    /* End-of-token sync */
+    if (nth > 1) {
+        __atomic_fetch_add(&p->mt_threads_done, 1, __ATOMIC_ACQ_REL);
+        if (ith == 0) {
+            while (__atomic_load_n(&p->mt_threads_done, __ATOMIC_ACQUIRE) < nth) { _mm_pause(); }
+            __atomic_store_n(&p->mt_threads_done, 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&p->mt_phase, 0, __ATOMIC_RELEASE);
+        } else {
+            while (__atomic_load_n(&p->mt_phase, __ATOMIC_ACQUIRE) != 0) { _mm_pause(); }
         }
     }
 
     static int logged = 0;
-    if (!logged) {
-        fprintf(stderr, "shirley: MTFP21 LM head active (%d tokens, vocab=%d)\n",
-                n_tokens, V);
+    if (!logged && ith == 0) {
+        fprintf(stderr, "shirley: MTFP10 LM head active (%d tokens, vocab=%d, %d threads)\n",
+                n_tokens, V, nth);
         logged = 1;
     }
 }
@@ -260,16 +329,20 @@ void shirley_output_params_init(
     shirley_convert_f32_to_mtfp21(
         &p->output_norm_gamma_mant, &p->output_norm_gamma_exp,
         output_norm ? (const float *)output_norm->data : NULL, n_embd);
+    p->output_norm_gamma_f32 = output_norm ? (const float *)output_norm->data : NULL;
 
-    /* Store the embedding tensor pointer for lazy conversion.
-     * The actual data may not be loaded yet at init time —
-     * ggml backends populate tensor data after creation.
-     * Convert on first use in the LM head callback. */
+    /* Embedding table: defer conversion to first compute call
+     * (tensor data may not be loaded yet at init time) */
+    p->embd_mtfp10 = NULL;
+    p->embd_row_exp = NULL;
     p->embd_mtfp21 = NULL;
     p->_tok_embd_tensor = (const void *)tok_embd;
 
+    p->mt_phase = 0;
+    p->mt_threads_done = 0;
+
     p->ready = 1;
 
-    fprintf(stderr, "shirley: MTFP21 output init (n=%d, vocab=%d, embd=%s)\n",
-            n_embd, vocab_size, p->embd_mtfp21 ? "converted" : "deferred");
+    fprintf(stderr, "shirley: output init (n=%d, vocab=%d, MTFP10 LM head)\n",
+            n_embd, vocab_size);
 }

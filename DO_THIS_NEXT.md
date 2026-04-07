@@ -30,11 +30,11 @@ Per layer:
     int8 × 2bit → sign_epi8 down matmul → float           [ALL threads]
     float: residual ADD                                     [thread 0]
 
-LM head: float32 matmul (ggml, 128K × 2560, memory-bound ~18ms)
-Output norm: MTFP21 scalar RMSNorm (single-threaded)
+LM head: MTFP10 int16 GEMV (madd_epi16, multi-threaded, 128K × 2560)
+Output norm: float RMSNorm (single-threaded)
 ```
 
-### Speed: ~18-20 tok/s (4 threads, clean system)
+### Speed: ~22-23 tok/s (4 threads) — matches/exceeds baseline
 
 | Milestone | tok/s | Change |
 |-----------|-------|--------|
@@ -44,17 +44,17 @@ Output norm: MTFP21 scalar RMSNorm (single-threaded)
 | + Native MTFP21 trivials | 4.57 | +5.5% |
 | + Kernel integration (sign_epi8) | 5.13 | +12% |
 | + Multi-threaded attention QKV+wo | 18.89 | **+268%** |
-| + Head-parallel body | 18.89 | structural |
-| Baseline BitNet (same model, stock) | ~22 | target |
+| + MTFP10 LM head (madd_epi16) | 23.02 | **+22%** |
+| Baseline BitNet (same model, stock) | ~22 | **matched** |
 
-### Time Budget Per Token (~50ms at 20 tok/s)
+### Time Budget Per Token (~43ms at 23 tok/s)
 
 | Component | ms | % | Notes |
 |-----------|-----|---|-------|
-| LM head (f16 float GEMV) | ~18 | 36% | 128K x 2560, memory-bound, shared with baseline |
-| FFN (30 layers) | ~22 | 44% | gate+up 51%, trivials 22%, down 22%, sub_norm 3% |
-| Attention (30 layers) | ~6 | 12% | QKV 53%, wo 33%, body 4% (grows with seq_len) |
-| ggml overhead | ~4 | 8% | dispatch, thread pool, embedding |
+| LM head (MTFP10 int16 GEMV) | ~8 | 19% | 128K x 2560, madd_epi16, multi-threaded |
+| FFN (30 layers) | ~22 | 51% | gate+up 51%, trivials 22%, down 22%, sub_norm 3% |
+| Attention (30 layers) | ~6 | 14% | QKV 53%, wo 33%, body 4% (grows with seq_len) |
+| ggml overhead | ~7 | 16% | dispatch, thread pool, embedding |
 
 ### What's Done
 
@@ -65,6 +65,7 @@ Output norm: MTFP21 scalar RMSNorm (single-threaded)
 - **AVX2 trivials:** rescale_i32_to_i8, relu_i8 (max_epi8), square_i8_to_i16, requantize_i16_to_i8
 - **shirley_rmsnorm_quantize:** fused float->int8 norm+gamma+quantize for matmul input
 - **shirley_rmsnorm_ternary:** int8->int8 norm (417ns, Q14 gamma, zero float) for FFN sub_norm
+- **MTFP10 LM head:** Embedding table → block-aligned int16 at load. GEMV via madd_epi16, multi-threaded. ~10ms saved vs float.
 - **Adaptive barrier (shirley_barrier.h):** _mm_pause() spin-waits, monotonic phase support
 - **Float attention body:** RoPE, Q@K^T, softmax, attn@V in float (hardware FPU)
 - **Precomputed MTFP21 tables:** RoPE sin/cos, gamma, eps, kq_scale
@@ -101,8 +102,9 @@ Stores float in reinterpreted int32 arrays. The exp arrays are allocated but unu
 
 ### Known Bugs
 
-- **Phase overflow:** Monotonic phase counter overflows int32 after ~10M tokens (INT_MAX / 210 per token = ~142 hours continuous generation). Not a concern for interactive use.
-- **Head-parallel hang:** Attention body partitioned across heads hangs deterministically at sequence position ~22-23 with 4 threads. Works with 1 or 2 threads. Root cause unknown.
+- **Generation quality:** Model produces incoherent text ("atural Rab titredaily" for "2+2="). Confirmed pre-existing — same garbage with float LM head and MTFP10 LM head. The layer compute (attention + FFN kernels) is producing values that compound incorrectly over 30 layers. Likely a precision or scaling issue in the kernel integration. **This is P0 for the next session.**
+- **Phase overflow:** Monotonic phase counter overflows int32 after ~10M tokens. Not a concern for interactive use.
+- **Head-parallel hang:** Attention body partitioned across heads hangs at seq_len ~22 with 4 threads. Root cause unknown.
 
 ## Lessons
 
