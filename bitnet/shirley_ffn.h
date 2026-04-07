@@ -39,6 +39,7 @@ struct shirley_ffn_params {
     int8_t  * ffn_sub_norm_gamma_exp;
     int16_t * ffn_sub_norm_gamma_q14;  /* Q14 for shirley_rmsnorm_ternary */
     const float * ffn_norm_gamma_f32;  /* float for shirley_rmsnorm_quantize */
+    const float * ffn_sub_norm_gamma_f32; /* float for sub_norm via rmsnorm_quantize */
 
     int8_t  * w_act;
     int8_t  * w_gate;
@@ -54,6 +55,7 @@ struct shirley_ffn_params {
     volatile int mt_phase;       /* atomic: 0=prep, 1=gate_up_ready, 2=gate_up_done, 3=down_ready, 4=down_done */
     int16_t * mt_act;            /* shared block-aligned activations */
     int8_t    mt_bexp;
+    float     mt_act_scale;    /* quantization scale from rmsnorm_quantize */
     void    * mt_gate;           /* mtfp21_t[n_ff] — for sub_norm path */
     void    * mt_up;             /* mtfp21_t[n_ff] */
     void    * mt_down;           /* mtfp21_t[n_embd] */

@@ -77,6 +77,8 @@ struct shirley_attn_params {
     volatile int mt_phase;
     volatile int mt_threads_done;
     int8_t  * mt_act_i8;      /* shared int8 activations for QKV matmul [n_embd] */
+    float     mt_act_scale;   /* quantization scale from rmsnorm_quantize */
+    float     mt_sub_scale;   /* quantization scale from sub_norm rmsnorm_quantize */
     float   * mt_q_f;         /* shared float output for Q matmul [n_embd] */
     float   * mt_k_f;         /* shared float output for K matmul [kv_dim] */
     float   * mt_v_f;         /* shared float output for V matmul [kv_dim] */

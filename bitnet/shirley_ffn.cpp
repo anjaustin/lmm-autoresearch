@@ -211,8 +211,9 @@ void shirley_ffn_compute(
 
         /* ---- RMSNorm → int8 (thread 0) ---- */
         if (ith == 0) {
-            shirley_rmsnorm_quantize(
+            float act_scale = shirley_rmsnorm_quantize(
                 (int8_t *)p->w_act, input, p->ffn_norm_gamma_f32, n, p->eps, 80);
+            p->mt_act_scale = act_scale;
             SP_LAP(ffn_norm);
             __atomic_store_n(&p->mt_phase, 1, __ATOMIC_RELEASE);
         } else {
@@ -224,23 +225,23 @@ void shirley_ffn_compute(
             int rows_per = (n_ff + nth - 1) / nth;
             int r0 = ith * rows_per;
             int r1 = r0 + rows_per; if (r1 > n_ff) r1 = n_ff;
+            float inv_act = (p->mt_act_scale > 0) ? 1.0f / p->mt_act_scale : 0.0f;
             if (r0 < r1) {
-                float gate_tmp[r1 - r0]; /* VLA */
-                ggml_gemv_i2_i8_s(n, gate_tmp, r1 - r0,
+                /* Gate: float output, properly scaled */
+                ggml_gemv_i2_i8_s(n, ((float *)p->mt_gate) + r0, r1 - r0,
                     (const char *)p->gate_data + (int64_t)r0 * (n / 4),
                     p->w_act, 1, r1 - r0);
-                float gate_cs = p->gate_wscale * p->gate_lscale;
-                for (int i = 0; i < r1 - r0; i++) {
-                    p->mt_gate_raw[r0 + i] = (int32_t)(gate_tmp[i] * gate_cs);
-                }
-                float up_tmp[r1 - r0]; /* VLA */
-                ggml_gemv_i2_i8_s(n, up_tmp, r1 - r0,
+                float gate_cs = inv_act * p->gate_wscale * p->gate_lscale;
+                for (int i = r0; i < r1; i++)
+                    ((float *)p->mt_gate)[i] *= gate_cs;
+
+                /* Up: float output, properly scaled */
+                ggml_gemv_i2_i8_s(n, ((float *)p->mt_up) + r0, r1 - r0,
                     (const char *)p->up_data + (int64_t)r0 * (n / 4),
                     p->w_act, 1, r1 - r0);
-                float up_cs = p->up_wscale * p->up_lscale;
-                for (int i = 0; i < r1 - r0; i++) {
-                    p->mt_up_raw[r0 + i] = (int32_t)(up_tmp[i] * up_cs);
-                }
+                float up_cs = inv_act * p->up_wscale * p->up_lscale;
+                for (int i = r0; i < r1; i++)
+                    ((float *)p->mt_up)[i] *= up_cs;
             }
         }
 
@@ -250,28 +251,25 @@ void shirley_ffn_compute(
             __atomic_store_n(&p->mt_threads_done, 0, __ATOMIC_RELEASE);
             SP_LAP(ffn_gate_up);
 
-            /* ---- PHASE 2: Trivials — AVX2 kernels (thread 0) ---- */
-            shirley_rescale_i32_to_i8(p->mt_gate_i8, p->mt_gate_raw, n_ff, 80);
-            shirley_rescale_i32_to_i8(p->mt_up_i8, p->mt_up_raw, n_ff, 80);
-            shirley_relu_i8(p->mt_gate_i8, p->mt_gate_i8, n_ff);
+            /* ---- PHASE 2: Trivials in float ---- */
+            {
+                float * gate_f = (float *)p->mt_gate;
+                float * up_f = (float *)p->mt_up;
+                float trivials_f[n_ff]; /* VLA */
+                for (int i = 0; i < n_ff; i++) {
+                    float g = gate_f[i];
+                    float relu = (g > 0.0f) ? g : 0.0f;
+                    float sq = relu * relu;
+                    trivials_f[i] = sq * up_f[i];
+                }
+                SP_LAP(ffn_trivials);
 
-            int16_t sq[n_ff]; /* VLA */
-            shirley_square_i8_to_i16(sq, p->mt_gate_i8, n_ff);
-
-            /* gate² × up: int16 × int8 → int32 → >>7 → int16 */
-            int16_t prod[n_ff]; /* VLA */
-            for (int i = 0; i < n_ff; i++) {
-                int32_t p32 = (int32_t)sq[i] * (int32_t)p->mt_up_i8[i];
-                prod[i] = (int16_t)(p32 >> 7);
+                /* ---- PHASE 3: Sub-norm → int8 with scale tracking ---- */
+                float sub_scale = shirley_rmsnorm_quantize(
+                    (int8_t *)p->w_act, trivials_f,
+                    p->ffn_sub_norm_gamma_f32, n_ff, p->eps, 80);
+                p->mt_act_scale = sub_scale;
             }
-            shirley_requantize_i16_to_i8(p->mt_trivials_i8, prod, n_ff, 80);
-            SP_LAP(ffn_trivials);
-
-            /* ---- PHASE 3: Sub-norm — shirley_rmsnorm_ternary, 417ns ---- */
-            int8_t sub_out[n_ff]; /* VLA */
-            shirley_rmsnorm_ternary(sub_out, p->mt_trivials_i8,
-                p->ffn_sub_norm_gamma_q14, n_ff, 80);
-            memcpy(p->w_act, sub_out, n_ff);
             SP_LAP(ffn_sub_norm);
 
             __atomic_store_n(&p->mt_phase, 3, __ATOMIC_RELEASE);
@@ -289,7 +287,8 @@ void shirley_ffn_compute(
                 ggml_gemv_i2_i8_s(n_ff, down_tmp, r1 - r0,
                     (const char *)p->down_data + (int64_t)r0 * (n_ff / 4),
                     p->w_act, 1, r1 - r0);
-                float down_cs = p->down_wscale * p->down_lscale;
+                float inv_sub = (p->mt_act_scale > 0) ? 1.0f / p->mt_act_scale : 0.0f;
+                float down_cs = inv_sub * p->down_wscale * p->down_lscale;
                 for (int i = 0; i < r1 - r0; i++) {
                     ((float *)p->mt_down)[r0 + i] = down_tmp[i] * down_cs;
                 }
@@ -371,8 +370,9 @@ void shirley_ffn_params_init(
     } else {
         p->ffn_sub_norm_gamma_q14 = NULL;
     }
-    /* Float gamma for shirley_rmsnorm_quantize (ffn_norm) */
+    /* Float gamma for shirley_rmsnorm_quantize */
     p->ffn_norm_gamma_f32 = ffn_norm ? (const float *)ffn_norm->data : NULL;
+    p->ffn_sub_norm_gamma_f32 = ffn_sub_norm ? (const float *)ffn_sub_norm->data : NULL;
 
     int max_dim = n_embd > n_ff ? n_embd : n_ff;
     p->w_act     = (int8_t  *)malloc(max_dim * sizeof(int8_t));

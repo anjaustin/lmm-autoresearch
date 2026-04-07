@@ -143,7 +143,8 @@ void shirley_attn_compute(
 
         /* ---- attn_norm (thread 0) ---- */
         if (ith == 0) {
-            shirley_rmsnorm_quantize(p->mt_act_i8, input, p->attn_norm_gamma_f32, n, p->eps, 80);
+            float act_scale = shirley_rmsnorm_quantize(p->mt_act_i8, input, p->attn_norm_gamma_f32, n, p->eps, 80);
+            p->mt_act_scale = act_scale;
             SP_LAP(attn_norm);
             __atomic_store_n(&p->mt_phase, 1, __ATOMIC_RELEASE);
         } else {
@@ -156,13 +157,15 @@ void shirley_attn_compute(
             int rows_per = (n + nth - 1) / nth;
             int r0 = ith * rows_per;
             int r1 = r0 + rows_per; if (r1 > n) r1 = n;
+            float inv_act = (p->mt_act_scale > 0) ? 1.0f / p->mt_act_scale : 0.0f;
             if (r0 < r1) {
                 float q_tmp[r1 - r0]; /* VLA */
                 ggml_gemv_i2_i8_s(n, q_tmp, r1 - r0,
                     (const char *)p->wq_data + (int64_t)r0 * (n / 4),
                     p->mt_act_i8, 1, r1 - r0);
+                float q_cs = inv_act * p->wq_wscale;
                 for (int i = 0; i < r1 - r0; i++)
-                    p->mt_q_f[r0 + i] = q_tmp[i] * p->wq_wscale;
+                    p->mt_q_f[r0 + i] = q_tmp[i] * q_cs;
             }
 
             /* K matmul: kv_dim output rows */
@@ -174,8 +177,9 @@ void shirley_attn_compute(
                 ggml_gemv_i2_i8_s(n, k_tmp, r1 - r0,
                     (const char *)p->wk_data + (int64_t)r0 * (n / 4),
                     p->mt_act_i8, 1, r1 - r0);
+                float k_cs = inv_act * p->wk_wscale;
                 for (int i = 0; i < r1 - r0; i++)
-                    p->mt_k_f[r0 + i] = k_tmp[i] * p->wk_wscale;
+                    p->mt_k_f[r0 + i] = k_tmp[i] * k_cs;
             }
 
             /* V matmul: kv_dim output rows */
@@ -186,8 +190,9 @@ void shirley_attn_compute(
                 ggml_gemv_i2_i8_s(n, v_tmp, r1 - r0,
                     (const char *)p->wv_data + (int64_t)r0 * (n / 4),
                     p->mt_act_i8, 1, r1 - r0);
+                float v_cs = inv_act * p->wv_wscale;
                 for (int i = 0; i < r1 - r0; i++)
-                    p->mt_v_f[r0 + i] = v_tmp[i] * p->wv_wscale;
+                    p->mt_v_f[r0 + i] = v_tmp[i] * v_cs;
             }
         }
 
@@ -270,7 +275,8 @@ void shirley_attn_compute(
             }
             SP_LAP(attn_av);
 
-            shirley_rmsnorm_quantize(p->mt_sub_i8, p->mt_attn_out, p->sub_norm_gamma_f32, n, p->eps, 80);
+            float sub_scale = shirley_rmsnorm_quantize(p->mt_sub_i8, p->mt_attn_out, p->sub_norm_gamma_f32, n, p->eps, 80);
+            p->mt_sub_scale = sub_scale;
             SP_LAP(attn_sub_norm);
 
             __atomic_store_n(&p->mt_phase, 3, __ATOMIC_RELEASE);
@@ -288,7 +294,8 @@ void shirley_attn_compute(
                 ggml_gemv_i2_i8_s(n, wo_tmp, r1 - r0,
                     (const char *)p->wo_data + (int64_t)r0 * (n / 4),
                     p->mt_sub_i8, 1, r1 - r0);
-                float wo_cs = p->wo_wscale * p->wo_lscale;
+                float inv_sub = (p->mt_sub_scale > 0) ? 1.0f / p->mt_sub_scale : 0.0f;
+                float wo_cs = inv_sub * p->wo_wscale * p->wo_lscale;
                 for (int i = 0; i < r1 - r0; i++) {
                     p->mt_wo_f[r0 + i] = wo_tmp[i] * wo_cs;
                 }
